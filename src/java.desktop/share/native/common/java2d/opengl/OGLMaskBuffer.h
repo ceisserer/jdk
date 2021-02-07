@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2005, 2006, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2007, 2012, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -23,18 +23,25 @@
  * questions.
  */
 
-#ifndef OGLMaskFill_h_Included
-#define OGLMaskFill_h_Included
+#ifndef OGLMaskBuffer_h_Included
+#define OGLMaskBuffer_h_Included
 
+#include "j2d_md.h"
 #include "OGLContext.h"
 
-void OGLMaskFill_MaskFill(OGLContext *oglc,
-                          jint x, jint y, jint w, jint h,
-                          jint maskoff, jint maskscan, jint masklen,
-                          unsigned char *pMask);
+void OGLMaskBuffer_FlushMaskCache();
 
-void OGLMaskFill_TurboMaskFill(OGLContext *oglc,
-                     jint x, jint y, jint w, jint h,
-                     jint maskoff);
+void OGLMaskBuffer_EnableMaskBuffer(OGLContext *oglc);
+void OGLMaskBuffer_DisableMaskBuffer(OGLContext *oglc);
 
-#endif /* OGLMaskFill_h_Included */
+
+
+void OGLMaskBuffer_AddMaskQuadTurbo(OGLContext *oglc,
+                           jint srcx, jint srcy,
+                           jint w, jint h, jint maskOffset);
+                           
+void waitForFence(GLsync sync);
+                           
+void OGLMaskBuffer_QueueMaskBufferFence(JNIEnv *env, OGLContext *oglc, jint fenceRegion, jint waitRegion);
+
+#endif /* OGLVertexCache_h_Included */

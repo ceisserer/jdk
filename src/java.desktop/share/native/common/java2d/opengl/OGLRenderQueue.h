@@ -96,6 +96,11 @@
  */
 #define OGL_STATE_PGRAM_OP -5
 
+/* TODO: Write Documentation 
+ * 
+ */
+#define OGL_STATE_MASKBUF_OP -6
+
 /*
  * Initializes the "previous operation" state to its default value.
  */

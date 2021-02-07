@@ -41,6 +41,7 @@
 #include "OGLSurfaceData.h"
 #include "OGLTextRenderer.h"
 #include "OGLVertexCache.h"
+#include "OGLMaskBuffer.h"
 
 /**
  * Used to track whether we are in a series of a simple primitive operations
@@ -345,6 +346,26 @@ Java_sun_java2d_opengl_OGLRenderQueue_flushBuffer
                 SKIP_BYTES(b, masklen);
             }
             break;
+        case sun_java2d_pipe_BufferedOpCodes_TURBO_MASK_FILL:
+            {
+                jint x        = NEXT_INT(b);
+                jint y        = NEXT_INT(b);
+                jint w        = NEXT_INT(b);
+                jint h        = NEXT_INT(b);
+                jint maskOffset      = NEXT_INT(b);
+                
+                OGLMaskFill_TurboMaskFill(oglc, x, y, w, h, maskOffset);
+            }
+            break;
+        case sun_java2d_pipe_BufferedOpCodes_MASK_BUFFER_FENCE:
+            {
+                jint fenceRegion = NEXT_INT(b);
+                jint waitRegion = NEXT_INT(b);
+                
+                OGLMaskBuffer_QueueMaskBufferFence(env, oglc, fenceRegion, waitRegion);
+            }
+            break;
+            
         case sun_java2d_pipe_BufferedOpCodes_MASK_BLIT:
             {
                 jint dstx     = NEXT_INT(b);
@@ -783,6 +804,9 @@ OGLRenderQueue_CheckPreviousOp(jint op)
     case OGL_STATE_MASK_OP:
         OGLVertexCache_DisableMaskCache(oglc);
         break;
+    case OGL_STATE_MASKBUF_OP:
+        OGLMaskBuffer_DisableMaskBuffer(oglc);
+        break;
     case OGL_STATE_GLYPH_OP:
         OGLTR_DisableGlyphVertexCache(oglc);
         break;
@@ -812,6 +836,9 @@ OGLRenderQueue_CheckPreviousOp(jint op)
         break;
     case OGL_STATE_MASK_OP:
         OGLVertexCache_EnableMaskCache(oglc);
+        break;
+    case OGL_STATE_MASKBUF_OP:
+        OGLMaskBuffer_EnableMaskBuffer(oglc);
         break;
     case OGL_STATE_GLYPH_OP:
         OGLTR_EnableGlyphVertexCache(oglc);

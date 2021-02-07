@@ -124,6 +124,7 @@ typedef void (GLAPIENTRY *glVertex2fType)(GLfloat x, GLfloat y);
 typedef void (GLAPIENTRY *glVertex2iType)(GLint x, GLint y);
 typedef void (GLAPIENTRY *glVertexPointerType)(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr);
 typedef void (GLAPIENTRY *glViewportType)(GLint x, GLint y, GLsizei width, GLsizei height);
+typedef void (GLAPIENTRY *glGetFloatvType)(GLenum pname, GLfloat * params);
 
 /**
  * OpenGL 1.2 and extension function typedefs (functions that were added in
@@ -171,6 +172,33 @@ typedef GLhandleARB (GLAPIENTRY *glCreateProgramObjectARBType)(void);
 typedef void (GLAPIENTRY *glAttachObjectARBType)(GLhandleARB, GLhandleARB);
 typedef void (GLAPIENTRY *glLinkProgramARBType)(GLhandleARB);
 typedef void (GLAPIENTRY *glDeleteObjectARBType)(GLhandleARB);
+
+
+/**
+ * New stuff
+ */
+typedef void (GLAPIENTRY *glGenBuffersType) (GLsizei n, GLuint * buffers);
+
+typedef void (GLAPIENTRY *glBindBufferType) (GLenum target, GLuint buffer);
+
+typedef void (GLAPIENTRY *glBufferStorageType)  (GLenum target, GLsizeiptr size, const void * data, GLbitfield flags);
+typedef void* (GLAPIENTRY *glMapBufferRangeType) (GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access);
+
+
+typedef void (GLAPIENTRY *glVertexAttribPointerType) (GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void * pointer);
+typedef void (GLAPIENTRY *glVertexAttribIPointerType) (GLuint index, GLint size, GLenum type, GLsizei stride, const void * pointer);
+
+typedef void (GLAPIENTRY *glEnableVertexAttribArrayType) (GLuint index);
+typedef void (GLAPIENTRY *glDisableVertexAttribArrayType) (GLuint index);
+typedef void (GLAPIENTRY *glBindBufferBaseType) (GLenum target, GLuint index, GLuint buffer);
+typedef void (GLAPIENTRY *glUniformMatrix4fvType)(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+
+typedef void (GLAPIENTRY *glGetProgramResourceivType)(GLuint program, GLenum programInterface, GLuint index, GLsizei propCount, const GLenum * props, GLsizei bufSize, GLsizei * length, GLint * params);
+
+typedef GLsync (GLAPIENTRY *glFenceSyncType)(GLenum condition, GLbitfield flags);
+typedef GLenum (GLAPIENTRY *glClientWaitSyncType)(GLsync sync, GLbitfield flags, GLuint64 timeout);
+typedef void (GLAPIENTRY *glDeleteSyncType)(GLsync sync);
+
 
 /**
  * GL_NV_texture_barrier extension function typedef's
@@ -286,7 +314,9 @@ typedef void (GLAPIENTRY *glTextureBarrierNVType) (void);
     OGL_##action##_FUNC(glVertex2f); \
     OGL_##action##_FUNC(glVertex2i); \
     OGL_##action##_FUNC(glVertexPointer); \
-    OGL_##action##_FUNC(glViewport);
+    OGL_##action##_FUNC(glViewport); \
+    OGL_##action##_FUNC(glGetFloatv); 
+    
 
 #define OGL_EXPRESS_EXT_FUNCS(action) \
     OGL_##action##_EXT_FUNC(glActiveTextureARB); \
@@ -322,7 +352,21 @@ typedef void (GLAPIENTRY *glTextureBarrierNVType) (void);
     OGL_##action##_EXT_FUNC(glGetInfoLogARB); \
     OGL_##action##_EXT_FUNC(glGetObjectParameterivARB); \
     OGL_##action##_EXT_FUNC(glDeleteObjectARB); \
-    OGL_##action##_EXT_FUNC(glTextureBarrierNV);
+    OGL_##action##_EXT_FUNC(glTextureBarrierNV); \
+    OGL_##action##_EXT_FUNC(glGenBuffers); \
+    OGL_##action##_EXT_FUNC(glBindBuffer); \
+    OGL_##action##_EXT_FUNC(glBufferStorage); \
+    OGL_##action##_EXT_FUNC(glMapBufferRange); \
+    OGL_##action##_EXT_FUNC(glVertexAttribPointer); \
+    OGL_##action##_EXT_FUNC(glVertexAttribIPointer); \
+    OGL_##action##_EXT_FUNC(glEnableVertexAttribArray); \
+    OGL_##action##_EXT_FUNC(glDisableVertexAttribArray); \
+    OGL_##action##_EXT_FUNC(glBindBufferBase); \
+    OGL_##action##_FUNC(glUniformMatrix4fv); \
+    OGL_##action##_FUNC(glGetProgramResourceiv); \
+    OGL_##action##_FUNC(glFenceSync); \
+    OGL_##action##_FUNC(glClientWaitSync); \
+    OGL_##action##_FUNC(glDeleteSync);
 
 #define OGL_EXPRESS_ALL_FUNCS(action) \
     OGL_EXPRESS_BASE_FUNCS(action) \

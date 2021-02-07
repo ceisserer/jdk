@@ -222,4 +222,6 @@ jboolean OGLContext_IsVersionSupported(const unsigned char *versionstr);
 
 GLhandleARB OGLContext_CreateFragmentProgram(const char *fragmentShaderSource);
 
+GLhandleARB OGLContext_CreateProgram(const char *vertexShaderSource, const char *fragmentShaderSource);
+
 #endif /* OGLContext_h_Included */

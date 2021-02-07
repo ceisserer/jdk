@@ -58,6 +58,8 @@
 module java.desktop {
     requires java.prefs;
 
+    requires jdk.unsupported;
+
     requires transitive java.datatransfer;
     requires transitive java.xml;
 

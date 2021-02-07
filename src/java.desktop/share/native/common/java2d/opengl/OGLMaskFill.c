@@ -30,6 +30,7 @@
 #include "OGLMaskFill.h"
 #include "OGLRenderQueue.h"
 #include "OGLVertexCache.h"
+#include "OGLMaskBuffer.h"
 
 /**
  * This implementation first copies the alpha tile into a texture and then
@@ -125,6 +126,17 @@ OGLMaskFill_MaskFill(OGLContext *oglc,
         }
     }
 }
+
+
+void OGLMaskFill_TurboMaskFill(OGLContext *oglc,
+                     jint x, jint y, jint w, jint h,
+                     jint maskoff)
+{
+    CHECK_PREVIOUS_OP(OGL_STATE_MASKBUF_OP);
+        
+    OGLMaskBuffer_AddMaskQuadTurbo(oglc, x, y, w, h, maskoff);
+}
+
 
 JNIEXPORT void JNICALL
 Java_sun_java2d_opengl_OGLMaskFill_maskFill

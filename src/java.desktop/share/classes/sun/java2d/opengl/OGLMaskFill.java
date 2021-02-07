@@ -25,16 +25,22 @@
 
 package sun.java2d.opengl;
 
-import java.awt.Composite;
+import java.awt.*;
+
 import sun.java2d.InvalidPipeException;
 import sun.java2d.SunGraphics2D;
+import sun.java2d.SurfaceData;
 import sun.java2d.loops.GraphicsPrimitive;
 import sun.java2d.loops.GraphicsPrimitiveMgr;
 import sun.java2d.loops.CompositeType;
 import sun.java2d.loops.SurfaceType;
+import sun.java2d.pipe.BufferedContext;
 import sun.java2d.pipe.BufferedMaskFill;
+import sun.java2d.pipe.RenderBuffer;
+
 import static sun.java2d.loops.CompositeType.*;
 import static sun.java2d.loops.SurfaceType.*;
+import static sun.java2d.pipe.BufferedOpCodes.*;
 
 class OGLMaskFill extends BufferedMaskFill {
 
@@ -80,4 +86,54 @@ class OGLMaskFill extends BufferedMaskFill {
                                    sg2d.getCompClip(), comp,
                                    null, sg2d.paint, sg2d, ctxflags);
     }
+
+
+  /*@Override
+  public void MaskFill(SunGraphics2D sg2d, SurfaceData sData,
+                       Composite comp,
+                       final int x, final int y, final int w, final int h,
+                       final byte[] mask,
+                       final int maskoff, final int maskscan)
+  {
+    OGLMaskBuffer.getInstance();
+    super.MaskFill(sg2d, sData, comp, x, y, w, h, mask, maskoff, maskscan);
+  }*/
+
+
+  @Override
+  public void MaskFill(SunGraphics2D sg2d, SurfaceData sData,
+                       Composite comp,
+                       final int x, final int y, final int w, final int h,
+                       final byte[] mask,
+                       final int maskoff, final int maskscan)
+  {
+    AlphaComposite acomp = (AlphaComposite)comp;
+    if (acomp.getRule() != AlphaComposite.SRC_OVER) {
+      comp = AlphaComposite.SrcOver;
+    }
+
+    rq.lock();
+    try {
+      validateContext(sg2d, comp, BufferedContext.USE_MASK);
+
+      rq.ensureCapacity(24);
+      RenderBuffer buf = rq.getBuffer();
+
+      OGLMaskBuffer maskBuffer = OGLMaskBuffer.getInstance();
+
+      int maskOffset = Integer.MAX_VALUE;
+      if(mask != null) {
+        maskOffset = maskBuffer.queueMaskQuad(rq, w, h, mask, maskscan, maskoff);
+      }
+
+      buf = rq.getBuffer();
+      buf.putInt(TURBO_MASK_FILL);
+      // enqueue parameters
+      buf.putInt(x).putInt(y).putInt(w).putInt(h);
+      buf.putInt(maskOffset);
+
+    } finally {
+      rq.unlock();
+    }
+  }
 }

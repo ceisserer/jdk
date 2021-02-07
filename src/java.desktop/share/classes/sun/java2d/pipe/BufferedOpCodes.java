@@ -96,4 +96,7 @@ public final class BufferedOpCodes {
     @Native public static final int DISABLE_RESCALE_OP     = 123;
     @Native public static final int ENABLE_LOOKUP_OP       = 124;
     @Native public static final int DISABLE_LOOKUP_OP      = 125;
+
+    @Native public static final int TURBO_MASK_FILL       = 126;
+    @Native public static final int MASK_BUFFER_FENCE     = 127;
 }

@@ -74,6 +74,9 @@ OGLBlendRule StdBlendRules[] = {
 #define OGLC_ACTIVE_BUFFER_NAME(buf) \
     (buf == GL_FRONT || buf == GL_COLOR_ATTACHMENT0_EXT) ? "front" : "back"
 
+float ortho[16];
+float* orthoPtr;
+
 /**
  * Initializes the viewport and projection matrix, effectively positioning
  * the origin at the top-left corner of the surface.  This allows Java 2D
@@ -99,6 +102,9 @@ OGLContext_SetViewport(OGLSDOps *srcOps, OGLSDOps *dstOps)
     j2d_glMatrixMode(GL_PROJECTION);
     j2d_glLoadIdentity();
     j2d_glOrtho(0.0, (GLdouble)width, (GLdouble)height, 0.0, -1.0, 1.0);
+    
+    j2d_glGetFloatv(GL_PROJECTION_MATRIX, ortho);
+    orthoPtr = ortho;
 
     // set the active read and draw buffers
     j2d_glReadBuffer(srcOps->activeBuffer);
@@ -958,61 +964,95 @@ OGLContext_IsVersionSupported(const unsigned char *versionstr)
  * program; otherwise returns 0.
  */
 GLhandleARB
-OGLContext_CreateFragmentProgram(const char *fragmentShaderSource)
-{
-    GLhandleARB fragmentShader, fragmentProgram;
+OGLContext_CreateFragmentProgram(const char *fragmentShaderSource) {
+   return OGLContext_CreateProgram(NULL, fragmentShaderSource);
+}
+
+
+
+GLint OGLContext_compileShader(GLint type, const char *shaderSource, GLhandleARB* shader) {
     GLint success;
     int infoLogLength = 0;
-
-    J2dTraceLn(J2D_TRACE_INFO, "OGLContext_CreateFragmentProgram");
-
+     
     // create the shader object and compile the shader source code
-    fragmentShader = j2d_glCreateShaderObjectARB(GL_FRAGMENT_SHADER_ARB);
-    j2d_glShaderSourceARB(fragmentShader, 1, &fragmentShaderSource, NULL);
-    j2d_glCompileShaderARB(fragmentShader);
-    j2d_glGetObjectParameterivARB(fragmentShader,
+    *shader = j2d_glCreateShaderObjectARB(type);
+    j2d_glShaderSourceARB(*shader, 1, &shaderSource, NULL);
+    j2d_glCompileShaderARB(*shader);
+    j2d_glGetObjectParameterivARB(*shader,
                                   GL_OBJECT_COMPILE_STATUS_ARB,
                                   &success);
 
     // print the compiler messages, if necessary
-    j2d_glGetObjectParameterivARB(fragmentShader,
+    j2d_glGetObjectParameterivARB(*shader,
                                   GL_OBJECT_INFO_LOG_LENGTH_ARB,
                                   &infoLogLength);
     if (infoLogLength > 1) {
         char infoLog[1024];
-        j2d_glGetInfoLogARB(fragmentShader, 1024, NULL, infoLog);
+        j2d_glGetInfoLogARB(*shader, 1024, NULL, infoLog);
         J2dRlsTraceLn2(J2D_TRACE_WARNING,
             "OGLContext_CreateFragmentProgram: compiler msg (%d):\n%s",
                        infoLogLength, infoLog);
+                       
+                       printf("%s", infoLog);
     }
 
     if (!success) {
         J2dRlsTraceLn(J2D_TRACE_ERROR,
             "OGLContext_CreateFragmentProgram: error compiling shader");
-        j2d_glDeleteObjectARB(fragmentShader);
+        j2d_glDeleteObjectARB(*shader);
         return 0;
     }
+    
+    return success;
+}
+
+/**
+ * Compiles and links the given fragment shader program.  If
+ * successful, this function returns a handle to the newly created shader
+ * program; otherwise returns 0.
+ */
+GLhandleARB
+OGLContext_CreateProgram(const char *vertexShaderSource, const char *fragmentShaderSource)
+{
+    GLhandleARB program;
+    GLhandleARB fragmentShader;
+    GLhandleARB vertexShader;
+    GLint success;
+    int infoLogLength = 0;
+
+    J2dTraceLn(J2D_TRACE_INFO, "OGLContext_CreateFragmentProgram");
 
     // create the program object and attach it to the shader
-    fragmentProgram = j2d_glCreateProgramObjectARB();
-    j2d_glAttachObjectARB(fragmentProgram, fragmentShader);
-
-    // it is now safe to delete the shader object
+    program = j2d_glCreateProgramObjectARB();
+    
+    if(!OGLContext_compileShader(GL_FRAGMENT_SHADER_ARB, fragmentShaderSource, &fragmentShader)) {
+        return 0;
+    }
+    j2d_glAttachObjectARB(program, fragmentShader);
     j2d_glDeleteObjectARB(fragmentShader);
+        
+    
+    if(vertexShaderSource != NULL) {
+        if(!OGLContext_compileShader(GL_VERTEX_SHADER_ARB, vertexShaderSource, &vertexShader)) {
+            return 0;
+        }
+        j2d_glAttachObjectARB(program, vertexShader);
+        j2d_glDeleteObjectARB(vertexShader);
+    }
 
     // link the program
-    j2d_glLinkProgramARB(fragmentProgram);
-    j2d_glGetObjectParameterivARB(fragmentProgram,
+    j2d_glLinkProgramARB(program);
+    j2d_glGetObjectParameterivARB(program,
                                   GL_OBJECT_LINK_STATUS_ARB,
                                   &success);
 
     // print the linker messages, if necessary
-    j2d_glGetObjectParameterivARB(fragmentProgram,
+    j2d_glGetObjectParameterivARB(program,
                                   GL_OBJECT_INFO_LOG_LENGTH_ARB,
                                   &infoLogLength);
     if (infoLogLength > 1) {
         char infoLog[1024];
-        j2d_glGetInfoLogARB(fragmentProgram, 1024, NULL, infoLog);
+        j2d_glGetInfoLogARB(program, 1024, NULL, infoLog);
         J2dRlsTraceLn2(J2D_TRACE_WARNING,
             "OGLContext_CreateFragmentProgram: linker msg (%d):\n%s",
                        infoLogLength, infoLog);
@@ -1021,11 +1061,11 @@ OGLContext_CreateFragmentProgram(const char *fragmentShaderSource)
     if (!success) {
         J2dRlsTraceLn(J2D_TRACE_ERROR,
             "OGLContext_CreateFragmentProgram: error linking shader");
-        j2d_glDeleteObjectARB(fragmentProgram);
+        j2d_glDeleteObjectARB(program);
         return 0;
     }
 
-    return fragmentProgram;
+    return program;
 }
 
 /*
