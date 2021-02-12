@@ -123,7 +123,7 @@ class OGLMaskFill extends BufferedMaskFill {
 
       int maskOffset = Integer.MAX_VALUE;
       if(mask != null) {
-        maskOffset = maskBuffer.queueMaskQuad(rq, w, h, mask, maskscan, maskoff);
+        maskOffset = maskBuffer.allocateMaskData(rq, w*h);
 
         // Just to illustrate how to write to VRAM
         long maskBuffPtr = maskBuffer.getMaskBufferBasePtr() + maskOffset;

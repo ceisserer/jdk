@@ -67,11 +67,10 @@ public class OGLMaskBuffer {
     currentBufferOffset = 0;
   }
 
-  public final int queueMaskQuad(RenderQueue queue, int w, int h, byte[] mask, int maskScan, int maskOff) {
+  public final int allocateMaskData(RenderQueue queue, int maskSize) {
     int offsetBefore = currentBufferOffset;
 
-    if(mask != null) {
-      int maskSize = w * h;
+      //int maskSize = w * h;
 
       int regionBefore = currentBufferOffset / MASK_BUFFER_REGION_SIZE;
 
@@ -120,7 +119,7 @@ public class OGLMaskBuffer {
           fenceCounter++;
         }
       }
-    }
+
     return offsetBefore;
   }
 
