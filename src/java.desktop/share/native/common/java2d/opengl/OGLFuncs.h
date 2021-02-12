@@ -199,6 +199,8 @@ typedef GLsync (GLAPIENTRY *glFenceSyncType)(GLenum condition, GLbitfield flags)
 typedef GLenum (GLAPIENTRY *glClientWaitSyncType)(GLsync sync, GLbitfield flags, GLuint64 timeout);
 typedef void (GLAPIENTRY *glDeleteSyncType)(GLsync sync);
 
+typedef void (GLAPIENTRY *glClearBufferSubDataType) (GLenum target, GLenum internalformat, GLintptr offset, GLsizeiptr size, GLenum format, GLenum type, const void * data);
+
 
 /**
  * GL_NV_texture_barrier extension function typedef's
@@ -366,7 +368,8 @@ typedef void (GLAPIENTRY *glTextureBarrierNVType) (void);
     OGL_##action##_FUNC(glGetProgramResourceiv); \
     OGL_##action##_FUNC(glFenceSync); \
     OGL_##action##_FUNC(glClientWaitSync); \
-    OGL_##action##_FUNC(glDeleteSync);
+    OGL_##action##_FUNC(glDeleteSync); \
+    OGL_##action##_FUNC(glClearBufferSubData);
 
 #define OGL_EXPRESS_ALL_FUNCS(action) \
     OGL_EXPRESS_BASE_FUNCS(action) \

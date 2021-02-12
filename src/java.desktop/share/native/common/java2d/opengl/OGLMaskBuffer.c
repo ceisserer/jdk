@@ -37,6 +37,7 @@
 
 #define GL_SHADER_STORAGE_BUFFER 0x90D2
 
+static int MASK_BUFFER_REGION_SIZE;
 static int maskBufferPos;
 static GLuint maskBufferID; 
 static unsigned char* maskBuffer;
@@ -87,6 +88,10 @@ OGLMaskBuffer_FlushMaskCache()
 void OGLMaskBuffer_QueueMaskBufferFence(JNIEnv *env, OGLContext *oglc, jint fenceRegion, jint waitRegion) {
     
     OGLMaskBuffer_FlushMaskCache();
+    
+    GLuint zero = 0;
+    j2d_glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, fenceRegion * MASK_BUFFER_REGION_SIZE, MASK_BUFFER_REGION_SIZE,  GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+    
     maskSyncs[fenceRegion] = j2d_glFenceSync( GL_SYNC_GPU_COMMANDS_COMPLETE, 0 );
     
     j2d_glFlush();
@@ -102,7 +107,7 @@ void OGLMaskBuffer_QueueMaskBufferFence(JNIEnv *env, OGLContext *oglc, jint fenc
 
 
 JNIEXPORT jlong JNICALL
-Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass cls, jint size) {
+Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass cls, jint size, jint regionSize) {
   
   const char gVertexShaderSource[] = {
                          "#version 130\n"
@@ -212,7 +217,8 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
   (*env)->SetStaticIntField(env,cls,jFieldId,stride);  
 
     
-    
+  MASK_BUFFER_REGION_SIZE = regionSize;
+
   j2d_glGenBuffers( 1, &maskBufferID );
   j2d_glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, maskBufferID);
   j2d_glBindBuffer(GL_SHADER_STORAGE_BUFFER, maskBufferID );
@@ -227,6 +233,9 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
                                
   j2d_glBufferStorage(GL_SHADER_STORAGE_BUFFER, bufferSize, 0, flags);
   maskBuffer = (unsigned char*) j2d_glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, bufferSize, flags ); 
+  
+  GLuint zero = 0;
+  j2d_glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, bufferSize, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
   
   printf("Buffer address from java: %d\n", maskBuffer);
   

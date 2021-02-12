@@ -60,7 +60,7 @@ public class OGLMaskBuffer {
 
   public OGLMaskBuffer() {
     vertexBufferBasePtr = allocateVertexBufferPtr(VERTEX_BUFFER_SIZE);
-    maskBufferBasePtr = allocateMaskBufferPtr(MASK_BUFFER_SIZE);
+    maskBufferBasePtr = allocateMaskBufferPtr(MASK_BUFFER_SIZE, MASK_BUFFER_REGION_SIZE);
 
     currentVtxPos = 0;
     lastVtxPos = 0;
@@ -123,7 +123,12 @@ public class OGLMaskBuffer {
 
       for (int i = 0; i < h; i++) {
         for (int m = 0; m < w; m++) {
-          UNSAFE.putByte(maskBuffPtr++, mask[maskOff + maskScan * i + m]);
+          byte source = mask[maskOff + maskScan * i + m];
+          //System.out.println(source);
+          if(source != 0) {
+            UNSAFE.putByte(maskBuffPtr, source);
+          }
+          maskBuffPtr++;
         }
       }
     }
@@ -138,7 +143,7 @@ public class OGLMaskBuffer {
     }
   }
 
-  private static native long allocateMaskBufferPtr(int size);
+  private static native long allocateMaskBufferPtr(int size, int regionSize);
 
   private static native long allocateVertexBufferPtr(int size);
 
