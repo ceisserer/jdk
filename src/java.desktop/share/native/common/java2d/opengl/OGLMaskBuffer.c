@@ -160,7 +160,7 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
                          "    uint arrayVal = mask[byteOffset / uint(4)]; \n"
                          "    uint byteShift = ((byteOffset %s uint(4)) * uint(8));"
                          "    uint grayVal = (arrayVal >> byteShift) & uint(0xFF); \n" 
-                         "    maskVal = grayVal / 255.0; \n"
+                         "    maskVal = float(grayVal) / 255.0; \n"
                          "  }"
                          ""
                          "  color = colorFrag * maskVal;"
