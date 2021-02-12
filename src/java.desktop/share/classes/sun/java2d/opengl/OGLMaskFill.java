@@ -124,6 +124,19 @@ class OGLMaskFill extends BufferedMaskFill {
       int maskOffset = Integer.MAX_VALUE;
       if(mask != null) {
         maskOffset = maskBuffer.queueMaskQuad(rq, w, h, mask, maskscan, maskoff);
+
+        // Just to illustrate how to write to VRAM
+        long maskBuffPtr = maskBuffer.getMaskBufferBasePtr() + maskOffset;
+        for (int i = 0; i < h; i++) {
+          for (int m = 0; m < w; m++) {
+            byte source = mask[maskoff + maskscan * i + m];
+            //System.out.println(source);
+            if(source != 0) {
+              OGLMaskBuffer.UNSAFE.putByte(maskBuffPtr, source);
+            }
+            maskBuffPtr++;
+          }
+        }
       }
 
       buf = rq.getBuffer();

@@ -31,7 +31,7 @@ public class OGLMaskBuffer {
 
   private volatile static OGLMaskBuffer buffer;
 
-  private static final Unsafe UNSAFE;
+  public static final Unsafe UNSAFE;
 
   private static int BUFFER_ARRAY_STRIDE = 1;
 
@@ -83,21 +83,21 @@ public class OGLMaskBuffer {
       currentBufferOffset += maskSize;
       int regionAfter = currentBufferOffset / MASK_BUFFER_REGION_SIZE;
 
-      if(regionBefore != regionAfter) {
-          queue.ensureCapacity(12);
-          RenderBuffer buffer = queue.getBuffer();
-          buffer.putInt(MASK_BUFFER_FENCE);
-          buffer.putInt(regionBefore);
+      if (regionBefore != regionAfter) {
+        queue.ensureCapacity(12);
+        RenderBuffer buffer = queue.getBuffer();
+        buffer.putInt(MASK_BUFFER_FENCE);
+        buffer.putInt(regionBefore);
 
-          boolean nextRegionPending;
+        boolean nextRegionPending;
         synchronized (pendingFences) {
           int waitRegion = (regionBefore + 2) % MASK_BUFFER_REGION_COUNT;
-          if(!pendingFences[waitRegion]) {
+          if (!pendingFences[waitRegion]) {
             waitRegion = -1;
           }
           buffer.putInt(waitRegion);
 
-            // enable in case async flush is available
+          // enable in case async flush is available
           //queue.flushNow(false);
 
           pendingFences[regionBefore] = true;
@@ -106,34 +106,26 @@ public class OGLMaskBuffer {
         }
 
         int fenceCounter = 0;
-        while(nextRegionPending) {
-        //  System.out.println("We have a real problem!!");
+        while (nextRegionPending) {
+          //  System.out.println("We have a real problem!!");
           queue.flushNow();
           synchronized (pendingFences) {
             nextRegionPending = pendingFences[regionAfter];
           }
 
-          if(fenceCounter > 0) {
+          if (fenceCounter > 0) {
             System.out.println(fenceCounter);
           }
 
           fenceCounter++;
         }
       }
-
-      for (int i = 0; i < h; i++) {
-        for (int m = 0; m < w; m++) {
-          byte source = mask[maskOff + maskScan * i + m];
-          //System.out.println(source);
-          if(source != 0) {
-            UNSAFE.putByte(maskBuffPtr, source);
-          }
-          maskBuffPtr++;
-        }
-      }
     }
-
     return offsetBefore;
+  }
+
+  public final long getMaskBufferBasePtr() {
+    return maskBufferBasePtr;
   }
 
   private static void setFenceAvailable(int fenceNum) {
@@ -146,8 +138,6 @@ public class OGLMaskBuffer {
   private static native long allocateMaskBufferPtr(int size, int regionSize);
 
   private static native long allocateVertexBufferPtr(int size);
-
-
 }
 
 
