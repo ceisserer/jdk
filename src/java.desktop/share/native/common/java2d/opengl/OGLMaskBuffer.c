@@ -1,4 +1,4 @@
- 
+
 /*
  * Copyright (c) 2007, 2012, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
@@ -39,7 +39,7 @@
 
 static int MASK_BUFFER_REGION_SIZE;
 static int maskBufferPos;
-static GLuint maskBufferID; 
+static GLuint maskBufferID;
 static unsigned char* maskBuffer;
 
 static int vtxBufferSize;
@@ -68,39 +68,34 @@ OGLMaskBuffer_FlushMaskCache()
     int vertexCnt = curVertPos - lastVertPos;
 
     if(vertexCnt > 0) {
-        
-        // We've just crossed a region boundary (1->2)
-        // Area 1 is now full (place fence)
-        // Area 2 is now written to
-        
        // printf("DrawArrays: %d, %d\n", lastVertPos, vertexCnt);
         j2d_glDrawArrays(GL_QUADS, lastVertPos, vertexCnt);
-        
+
         if(curVertPos == vtxBufferSize) {
             curVertPos = 0;
         }
-        
+
         lastVertPos = curVertPos;
     }
 }
 
 
 void OGLMaskBuffer_QueueMaskBufferFence(JNIEnv *env, OGLContext *oglc, jint fenceRegion, jint waitRegion) {
-    
+
     OGLMaskBuffer_FlushMaskCache();
-    
-    GLuint zero = 0;
-    j2d_glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, fenceRegion * MASK_BUFFER_REGION_SIZE, MASK_BUFFER_REGION_SIZE,  GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
-    
+
+   // j2d_glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, fenceRegion * MASK_BUFFER_REGION_SIZE, MASK_BUFFER_REGION_SIZE, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
+
     maskSyncs[fenceRegion] = j2d_glFenceSync( GL_SYNC_GPU_COMMANDS_COMPLETE, 0 );
-    
+
     j2d_glFlush();
-    
+
+   // waitRegion = fenceRegion;
+
     if(waitRegion >= 0) {
         waitForFence(maskSyncs[waitRegion]);
         maskSyncs[waitRegion] = NULL;
-        
-       // printf("calling available with %d\n", waitRegion);
+        memset(&maskBuffer[waitRegion * MASK_BUFFER_REGION_SIZE], 0, MASK_BUFFER_REGION_SIZE);
         (*env)->CallStaticVoidMethod(env, maskBufferCls, setFenceAvailableId, waitRegion);
     }
 }
@@ -108,7 +103,7 @@ void OGLMaskBuffer_QueueMaskBufferFence(JNIEnv *env, OGLContext *oglc, jint fenc
 
 JNIEXPORT jlong JNICALL
 Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass cls, jint size, jint regionSize) {
-  
+
   const char gVertexShaderSource[] = {
                          "#version 130\n"
                          ""
@@ -135,9 +130,9 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
                          "  float a = (ba >> 8) & uint(0xFF); \n"
                          "  colorFrag = vec4(r,g,b,a) / 255; \n"
                          "  gl_Position = transform * vec4(position, 0.0, 1.0);\n"
-                         "}\n" 
+                         "}\n"
                          };
-                         
+
   const char gFragmentShaderSource[] = {
                           "%s"
                          "#extension GL_ARB_shader_storage_buffer_object : enable\n"
@@ -152,8 +147,8 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
                          "flat in uvec2 boundingBoxScreenFrag;"
                          "flat in uvec2 maksTilePosFrag;" //x = offset in ssbo in bytes, y = width of the mask in pixels
                          "flat in vec4 colorFrag;"
-                         "" 
-                         "out vec4 color;\n"          
+                         ""
+                         "out vec4 color;\n"
                          "void main(void)\n"
                          "{\n"
                          "   float maskVal = 1.0;"
@@ -164,35 +159,35 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
                          "    uint byteOffset = maksTilePosFrag.x + relativePosInBoundingBox.y * maksTilePosFrag.y + relativePosInBoundingBox.x;"
                          "    uint arrayVal = mask[byteOffset / uint(4)]; \n"
                          "    uint byteShift = ((byteOffset %s uint(4)) * uint(8));"
-                         "    uint grayVal = (arrayVal >> byteShift) & uint(0xFF); \n" 
+                         "    uint grayVal = (arrayVal >> byteShift) & uint(0xFF); \n"
                          "    maskVal = float(grayVal) / 255.0; \n"
                          "  }"
                          ""
                          "  color = colorFrag * maskVal;"
-                         "}\n" 
+                         "}\n"
                          };
-                         
+
                          char finalFragSource[4000];
                          memset(finalFragSource, 0, 4000);
-                    
+
                         const GLubyte* glVersion = j2d_glGetString(GL_VERSION);
                         int major = glVersion[0] - '0';
-                        int minor = glVersion[2] - '0';  
-                        
-                        
-                         
+                        int minor = glVersion[2] - '0';
+
+
+
                          if(major >= 4 || (major >= 3 && minor >= 1)) {
-                            sprintf(finalFragSource, gFragmentShaderSource, "#version 140\n", "std430,", "%");  
-                            printf("GLSL 140 path\n");                 
-                          } 
-                        else if(major >= 3) 
+                            sprintf(finalFragSource, gFragmentShaderSource, "#version 140\n", "std430,", "%");
+                            printf("GLSL 140 path\n");
+                          }
+                        else if(major >= 3)
                         {
-                            sprintf(finalFragSource, gFragmentShaderSource, "#version 130\n", "", "%");  
+                            sprintf(finalFragSource, gFragmentShaderSource, "#version 130\n", "", "%");
                             printf("GLSL 130 path\n");
                         } else {
                             printf("GL too old!\n");
                         }
-                                          
+
         maskFillProg = OGLContext_CreateProgram(gVertexShaderSource, finalFragSource);
     if (maskFillProg == 0) {
         printf("error!!!\n");
@@ -200,7 +195,7 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
             "OGLPaints_CreateMultiGradProgram: error creating program");
         return 0;
     }
-    
+
     transform_location = j2d_glGetUniformLocationARB(maskFillProg, "transform");
 
 
@@ -213,10 +208,10 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
   setFenceAvailableId = (*env)->GetStaticMethodID(env, cls, "setFenceAvailable", "(I)V");
   printf("MID: %d\n", setFenceAvailableId);
   maskBufferCls = cls;
-  
-  (*env)->SetStaticIntField(env,cls,jFieldId,stride);  
 
-    
+  (*env)->SetStaticIntField(env,cls,jFieldId,stride);
+
+
   MASK_BUFFER_REGION_SIZE = regionSize;
 
   j2d_glGenBuffers( 1, &maskBufferID );
@@ -225,40 +220,41 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateMaskBufferPtr(JNIEnv *env, jclass c
 
   //Create an immutable data store for the buffer
   size_t bufferSize = size; //1024 * 1024 * 4;
-  GLbitfield flags = GL_MAP_WRITE_BIT | 
+  GLbitfield flags = GL_MAP_WRITE_BIT |
                                GL_MAP_PERSISTENT_BIT |
                                GL_MAP_COHERENT_BIT;
-                               
 
-                               
+
+
   j2d_glBufferStorage(GL_SHADER_STORAGE_BUFFER, bufferSize, 0, flags);
-  maskBuffer = (unsigned char*) j2d_glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, bufferSize, flags ); 
-  
-  GLuint zero = 0;
-  j2d_glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, bufferSize, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
-  
+  maskBuffer = (unsigned char*) j2d_glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, bufferSize, flags );
+
+  //GLuint zero = 0;
+ // j2d_glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, bufferSize, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+  memset(maskBuffer, 0, bufferSize);
+
   printf("Buffer address from java: %d\n", maskBuffer);
-  
+
   maskBufferPos = 0;
-  
+
   return (jlong) maskBuffer;
-  
+
   return 0;
 }
 
 JNIEXPORT jlong JNICALL
 Java_sun_java2d_opengl_OGLMaskBuffer_allocateVertexBufferPtr(JNIEnv *env, jobject self, jint size) {
-  //Vertex-Data per Mask-Quad: 1 Vertex = 8*sizeof(float) = 32 byte
-  vtxBufferSize = size / 32;
-  vtxPerArea = vtxBufferSize / 3;
-
-  vtxPerArea -= vtxPerArea % 4;
+  //Vertex-Data per Mask-Quad: 1 Vertex = 8*sizeof(float) = 32 byte -> 4 Quad = 128 byte
+  jint quadsPerRegion = (size / 3) / 128;
+  vtxPerArea = quadsPerRegion * 4;
   vtxBufferSize = vtxPerArea * 3;
 
+  printf("Vertices per Area: %d\n", vtxPerArea);
+
   size = vtxBufferSize * 32;
-    
-  j2d_glGenBuffers(1, &VboID); 
-  j2d_glBindBuffer(GL_ARRAY_BUFFER, VboID); 
+
+  j2d_glGenBuffers(1, &VboID);
+  j2d_glBindBuffer(GL_ARRAY_BUFFER, VboID);
   GLbitfield vertFlags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
   j2d_glBufferStorage( GL_ARRAY_BUFFER, size, 0, vertFlags);
   unsigned char* vertexBuffer = (unsigned char*) j2d_glMapBufferRange( GL_ARRAY_BUFFER, 0, size, vertFlags );
@@ -266,7 +262,7 @@ Java_sun_java2d_opengl_OGLMaskBuffer_allocateVertexBufferPtr(JNIEnv *env, jobjec
   tileDataVtx = (GLuint*) &vertexBuffer[size / 2];
   curVertPos = 0;
   lastVertPos = 0;
-  
+
   return (jlong) vtxPosAndSource;
 }
 
@@ -282,15 +278,15 @@ OGLMaskBuffer_EnableMaskBuffer(OGLContext *oglc)
             printf("Program not initialized\n");
     }
 
-    
+
   j2d_glUseProgramObjectARB(maskFillProg);
-    
+
   j2d_glBindBuffer(GL_SHADER_STORAGE_BUFFER, maskBufferID );
-  j2d_glBindBuffer(GL_ARRAY_BUFFER, VboID); 
+  j2d_glBindBuffer(GL_ARRAY_BUFFER, VboID);
 
   j2d_glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
   j2d_glVertexAttribIPointer(1, 4, GL_UNSIGNED_INT, 0, (const void*) (vtxBufferSize * 32 / 2));
-  
+
   j2d_glEnableVertexAttribArray(0);
   j2d_glEnableVertexAttribArray(1);
 
@@ -304,9 +300,14 @@ OGLMaskBuffer_DisableMaskBuffer(OGLContext *oglc)
     J2dTraceLn(J2D_TRACE_INFO, "OGLMaskBUffer_DisableMaskCache");
 
     OGLMaskBuffer_FlushMaskCache();
-   
-   j2d_glDisableVertexAttribArray(1); 
+
+        if (oglc->paintState == sun_java2d_SunGraphics2D_PAINT_ALPHACOLOR) {
+            OGLPaints_SetColor(oglc, oglc->pixel);
+        }
+
+   j2d_glDisableVertexAttribArray(1);
    j2d_glDisableVertexAttribArray(0);
+
    j2d_glUseProgramObjectARB(0);
 }
 
@@ -314,9 +315,9 @@ OGLMaskBuffer_DisableMaskBuffer(OGLContext *oglc)
 void waitForFence(GLsync sync) {
     GLenum waitReturn;
     do {
-        waitReturn = j2d_glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000);
+        waitReturn = j2d_glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 100000);
     } while( waitReturn != GL_ALREADY_SIGNALED && waitReturn != GL_CONDITION_SATISFIED);
-    
+
     j2d_glDeleteSync( sync );
 }
 
@@ -325,35 +326,39 @@ void queueMaskQuad(int dstX, int dstY, int w, int h, int maskOffset, int r, int 
     // We'll cross region boundary with this quad, so make sure the GPU is done with the vtx data previsouly stored here
     // TODO: Make sure region size aligns perfectly with quad vertex count (4), so we can do the check below
     if(curVertPos % vtxPerArea == 0) {
-        //if(curVertPos == vtxBufferSize) 
+            // We've just crossed a region boundary (1->2)
+            // Area x is now full (place fence)
+            // Area x+1 is now written to
+
+        //if(curVertPos == vtxBufferSize)
         {
             OGLMaskBuffer_FlushMaskCache();
         }
-        
+
         int nextRegion = curVertPos / vtxPerArea;
         int lastRegion = (nextRegion + 2) % 3;
-        
-       // printf("Fence was placed: %d, %d\n",lastRegion, nextRegion );
-        
+
+        //printf("VTX: Fence was placed: %d, %d\n",lastRegion, nextRegion );
+
         if(vtxSyncs[lastRegion] != NULL) {
-            printf("Sync was in progress! %d\n", lastRegion);
+            printf("VTX: Sync was in progress! %d\n", lastRegion);
         }
-        
+
         vtxSyncs[lastRegion] = j2d_glFenceSync( GL_SYNC_GPU_COMMANDS_COMPLETE, 0 );
-        
-        
-        GLsync nextSync = vtxSyncs[nextRegion];
+
+      //TODO: Test-Code - Sync immediatly the queued fence
+        GLsync nextSync = vtxSyncs[nextRegion]; //vtxSyncs[lastRegion]; //
         if(nextSync != NULL) {
-           // printf("waiting for fence, vtxPer: %d, %d\n", nextRegion, vtxPerArea); 
-            
+          //  printf("VTX: waiting for fence, vtxPer: %d, %d\n", nextRegion, vtxPerArea);
+
             waitForFence(nextSync);
             vtxSyncs[nextRegion] = NULL;
         }
     }
-    
+
     int dstX2 = dstX + w;
     int dstY2 = dstY + h;
-        
+
     // 1 Quad -> 4 points
     GLfloat* vert = &vtxPosAndSource[4 * curVertPos];
     vert[0] = dstX;
@@ -364,10 +369,10 @@ void queueMaskQuad(int dstX, int dstY, int w, int h, int maskOffset, int r, int 
     vert[9] = dstY2;
     vert[12] = dstX;
     vert[13] = dstY2;
-    
-    // we are using "flat" interpolation 
+
+    // we are using "flat" interpolation
     // -> set attributes only for the "provoking" vertex (last vertex of a quad)
-    
+
     if(setColor) {
         vert[14] = (g << 8) + r;
         vert[15] = (a << 8) + b;
@@ -375,10 +380,10 @@ void queueMaskQuad(int dstX, int dstY, int w, int h, int maskOffset, int r, int 
 
     GLuint* tileData = &tileDataVtx[curVertPos * 4];
     tileData[12] = dstX;
-    tileData[13] = dstY;       
+    tileData[13] = dstY;
     tileData[14] = maskOffset;
     tileData[15] = w;
-  
+
     curVertPos += 4;
 }
 
@@ -389,7 +394,7 @@ OGLMaskBuffer_AddMaskQuadTurbo(OGLContext *oglc,
                            jint dstx, jint dsty,
                            jint w, jint h, jint maskOffset) {
 
-    queueMaskQuad(dstx, dsty, w, h, maskOffset, oglc->r, oglc->g, oglc->b, oglc->a, 1);    
+    queueMaskQuad(dstx, dsty, w, h, maskOffset, oglc->r, oglc->g, oglc->b, oglc->a, 1);
 }
 
 #endif /* !HEADLESS */
