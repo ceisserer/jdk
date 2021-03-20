@@ -70,55 +70,73 @@ public class OGLMaskBuffer {
   public final int allocateMaskData(RenderQueue queue, int maskSize) {
     int offsetBefore = currentBufferOffset;
 
-      //int maskSize = w * h;
+    // System.out.println("Requested " +maskSize +" offset before: " + offsetBefore);
 
-      int regionBefore = currentBufferOffset / MASK_BUFFER_REGION_SIZE;
+    //int maskSize = w * h;
 
-      if (currentBufferOffset + maskSize >= MASK_BUFFER_SIZE) {
-        offsetBefore = currentBufferOffset = 0;
+    int regionBefore = currentBufferOffset / MASK_BUFFER_REGION_SIZE;
+
+    if (currentBufferOffset + maskSize >= MASK_BUFFER_SIZE) {
+      offsetBefore = currentBufferOffset = 0;
+    }
+
+    currentBufferOffset += maskSize;
+
+    // Align offset to multiple of 8
+    currentBufferOffset = (currentBufferOffset + 7) & ~7;
+
+    int regionAfter = currentBufferOffset / MASK_BUFFER_REGION_SIZE;
+
+    if (regionBefore != regionAfter) {
+      offsetBefore = (MASK_BUFFER_REGION_SIZE * regionAfter);
+      currentBufferOffset = offsetBefore + maskSize;
+
+      queue.ensureCapacity(12);
+      RenderBuffer buffer = queue.getBuffer();
+      buffer.putInt(MASK_BUFFER_FENCE);
+      buffer.putInt(regionBefore);
+
+      boolean nextRegionPending;
+      synchronized (pendingFences) {
+        // Optimization: Queue the wait for a fence one region before we actually need the region to be available.
+        // Therefore we might save a few flushNow() synchronizations,
+        // because the wait for region we need has been queued before (and maybe flushed because other draw calls)
+        // E.g.: region 3 was just filled up -> place fence for region 3
+        // and queue a wait for region region 1.
+        // region 0's wait we require now was placed earlier, and might have been processed without an explicit flushNow
+        int waitRegion = (regionBefore + 2) % MASK_BUFFER_REGION_COUNT;
+        if (!pendingFences[waitRegion]) {
+          waitRegion = -1;
+        }
+        buffer.putInt(waitRegion);
+        //System.out.println("BUF: placing fence for:"+regionBefore+" waiting for: "+waitRegion);
+
+        // enable in case async flush is available
+        //queue.flushNow(false);
+
+        pendingFences[regionBefore] = true;
+
+        // We need the next region now, so check, if it is already available (fence was waited on earlier)
+        nextRegionPending = pendingFences[regionAfter];
       }
-      long maskBuffPtr = maskBufferBasePtr + currentBufferOffset;
 
-      currentBufferOffset += maskSize;
-      int regionAfter = currentBufferOffset / MASK_BUFFER_REGION_SIZE;
-
-      if (regionBefore != regionAfter) {
-        queue.ensureCapacity(12);
-        RenderBuffer buffer = queue.getBuffer();
-        buffer.putInt(MASK_BUFFER_FENCE);
-        buffer.putInt(regionBefore);
-
-        boolean nextRegionPending;
+      // If fence was not met, we have to explicitly flush, the wait has been queued earlier,
+      // but was not yet processed by the OpenGL queue thread.
+      int fenceCounter = 0;
+      while (nextRegionPending) {
+        //System.out.println("explicit flush");
+        queue.flushNow();
         synchronized (pendingFences) {
-          int waitRegion = (regionBefore + 2) % MASK_BUFFER_REGION_COUNT;
-          if (!pendingFences[waitRegion]) {
-            waitRegion = -1;
-          }
-          buffer.putInt(waitRegion);
-
-          // enable in case async flush is available
-          //queue.flushNow(false);
-
-          pendingFences[regionBefore] = true;
-
           nextRegionPending = pendingFences[regionAfter];
         }
 
-        int fenceCounter = 0;
-        while (nextRegionPending) {
-          //  System.out.println("We have a real problem!!");
-          queue.flushNow();
-          synchronized (pendingFences) {
-            nextRegionPending = pendingFences[regionAfter];
-          }
-
-          if (fenceCounter > 0) {
-            System.out.println(fenceCounter);
-          }
-
-          fenceCounter++;
+        // should not happen in sync flush mode
+        if (fenceCounter > 0) {
+          throw new RuntimeException("Aborting fence stall");
         }
+        fenceCounter++;
       }
+    }
 
     return offsetBefore;
   }
