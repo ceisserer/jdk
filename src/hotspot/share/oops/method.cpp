@@ -56,6 +56,9 @@
 #include "oops/jmethodIDTable.hpp"
 #include "oops/klass.inline.hpp"
 #include "oops/method.inline.hpp"
+#ifdef __EMSCRIPTEN__
+#include "wasmJitSpike_zero.hpp"
+#endif
 #include "oops/methodData.hpp"
 #include "oops/objArrayKlass.hpp"
 #include "oops/objArrayOop.inline.hpp"
@@ -1334,6 +1337,10 @@ void Method::link_method(const methodHandle& h_method, TRAPS) {
   assert(entry != nullptr, "interpreter entry must be non-null");
   // Sets both _i2i_entry and _from_interpreted_entry
   set_interpreter_entry(entry);
+
+#ifdef __EMSCRIPTEN__
+  WasmJitSpike::maybe_install(h_method, CHECK); // experimental, off unless WASM_JIT_SPIKE is set
+#endif
 
   // Don't overwrite already registered native entries.
   if (is_native() && !has_native_function()) {

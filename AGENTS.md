@@ -47,6 +47,12 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
     decoding, pointer-sized references, klass word not copied).
   - `src/java.base/unix/native/libnio/fs/UnixNativeDispatcher.c`: bind
     `openat`/`fstatat`/`fdopendir` directly.
+  - `src/hotspot/share/interpreter/zero/bytecodeInterpreter.cpp`: safepoint
+    polls on backward branches (upstream Zero bug fix, not guarded; affects all
+    Zero platforms).
+  - `src/hotspot/cpu/zero/wasmJitSpike_zero.{hpp,cpp}` + hook in
+    `src/hotspot/share/oops/method.cpp`: experimental runtime code installation,
+    off unless `WASM_JIT_SPIKE` is set (see `wasm/spike/README.md`).
   - `src/java.base/share/classes/jdk/internal/util/Architecture.java` and
     `PlatformProps.java.template`: `WASM32` architecture (plus
     `test/jdk/jdk/internal/util/ArchTest.java`).
@@ -108,8 +114,9 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 6. **musl headers declare nothing `noexcept`.** HotSpot's forbidden-function
    redeclarations must not add `noexcept` (handled like BSD).
 7. **`dlsym(RTLD_DEFAULT, ...)` needs `-sMAIN_MODULE=1`.** The static JDK resolves
-   JNI functions that way. It makes `java.wasm` about 3.8 MB. A generated table
-   of JNI symbols would be the smaller fix.
+   JNI functions that way. It makes `java.wasm` about 3.8 MB. Keep dynamic
+   linking (generated code is loaded as side modules), but narrow the exports
+   (`MAIN_MODULE=2`, see next steps).
 8. **A failed VM init hangs instead of exiting** (exit while pthreads are alive).
    `wasm/run.sh` preloads `wasm/js/killer.js` (`KILL_AFTER` ms). Do not pipe the
    output into `head`; output can look lost when the process hangs.
@@ -162,6 +169,19 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
       `Klass*`; symptom: "guarantee(... is_oop(loader())) failed: Loader must be
       oop" in `SystemDictionary::register_loader`.
     The writer side needed no changes.
+
+18. **Zero had no safepoint polls on backward branches** (upstream bug,
+    `DO_BACKEDGE_CHECKS` was empty). A thread in a call-free loop blocked every
+    safepoint (GC, deoptimization, VM exit on SIGTERM), on native Zero too.
+    Fixed; regression test `wasm/test/Spin.java`. The poll uses a plain
+    `volatile` pre-check, because the acquire load in `should_process()` is an
+    atomic load on wasm32 and slowed loops by up to 2.4x.
+19. **`dlopen` with pthreads needs all threads to cooperate:** every thread
+    loads the module into its own instance when it processes its Emscripten
+    mailbox, which only happens while it waits. Load generated code at a
+    safepoint (`wasm/spike/README.md`), never while Java threads may spin.
+20. **A hung native JVM ignores `timeout`'s SIGTERM** (orderly shutdown needs a
+    safepoint); use `timeout -s KILL`.
 
 ## Debugging technique that worked
 
@@ -229,15 +249,45 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
   - pthreads + `ALLOW_MEMORY_GROWTH` overhead (`growMemViews`): about 0.8 s.
   - `memset` of reservations: about 0.4 s.
 
+## Interpreter speed (CPU benchmark `wasm/test/Bench.java`, ms, 4 cores)
+
+| Kernel | HotSpot JIT | HotSpot `-Xint` | Zero native | Zero wasm |
+|---|---|---|---|---|
+| intLoop | 5 | 24 | 23 | 48 |
+| fields | 4 | 26 | 23 | 65 |
+| calls | 9 | 24 | 50 | 217 |
+| sieve | 6 | 17 | 22 | 32 |
+| alloc | 5 | 27 | 59 | 231 |
+| longDouble | 3 | 19 | 20 | 91 |
+| strings | 13 | 127 | 290 | 1669 |
+| total | 45 | 264 | 487 | 2353 |
+
+- Native Zero (built from this tree, `--with-jvm-variants=zero`, run as
+  `java -zero` from a copy of the build JDK with `lib/zero/libjvm.so` and a
+  `-zero KNOWN` line in `lib/jvm.cfg`) is as fast as the template interpreter on
+  loops but about 2x slower on calls and allocation.
+- Wasm costs another 1.5-2x on simple loops, but 4-6x on calls, allocation and
+  call-heavy code: those are the targets for a compiler (direct calls, inline
+  allocation fast path).
+- Runtime code installation works (`wasm/spike/README.md`): about 21 to 28 ms per
+  `dlopen` at a safepoint; a Wasm callee cut 1M calls from an interpreted loop
+  from 245 to 112 ns/call; the rest is the interpreted caller.
+
 ## Next steps
 
-1. Reduce the cost per worker (each loads all of `java.js`/`java.wasm`): a smaller
-   module without `MAIN_MODULE` (its GOT/table setup took about 35 ms on the main
+1. Bytecode-to-Wasm baseline compiler emitting side modules in the spike's
+   format (Zero entry ABI, frames in Zero layout, loaded at a safepoint, several
+   methods per module); compiled callers calling compiled callees directly.
+2. Reduce the cost per worker (each loads all of `java.js`/`java.wasm`): a smaller
+   module (the `MAIN_MODULE=1` GOT/table setup took about 35 ms on the main
    thread), and fewer HotSpot threads at startup.
-2. Avoid zeroing large reservations (reserve lazily, or zero on commit only) and
+3. Avoid zeroing large reservations (reserve lazily, or zero on commit only) and
    try a fixed-size Wasm heap (no `ALLOW_MEMORY_GROWTH`).
-3. Replace `MAIN_MODULE` with a generated table of JNI symbols.
-4. Browser embedding: COOP/COEP headers, a preloaded virtual file system instead
+4. Replace `-sMAIN_MODULE=1` (exports everything) with `-sMAIN_MODULE=2` and an
+   explicit export list: the JNI symbols the static JDK looks up with `dlsym`,
+   plus the runtime helpers generated code imports. Dynamic linking itself
+   stays: runtime-generated side modules need it.
+5. Browser embedding: COOP/COEP headers, a preloaded virtual file system instead
    of `NODERAWFS`, and running in a worker.
-5. Later: a bytecode-to-Wasm code tier whose frames live on the Zero stack (like
+6. Later: an optimizing Wasm tier whose frames live on the Zero stack (like
    the old Shark design), loaded from the AOT cache.

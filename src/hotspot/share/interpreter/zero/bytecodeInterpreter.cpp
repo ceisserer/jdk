@@ -303,7 +303,19 @@ JRT_END
 
 #define METHOD istate->method()
 #define GET_METHOD_COUNTERS(res)
-#define DO_BACKEDGE_CHECKS(skip, branch_pc)
+// Poll for safepoints on backward branches. Without this, a thread running a
+// loop without calls or returns (e.g. "while (!stop) x++;") never reaches a
+// safepoint, and every safepoint operation (GC, deoptimization, VM exit on
+// SIGTERM) hangs. The branch macros have already updated pc and the stack top.
+// The plain (volatile, non-atomic) pre-check keeps the hot path cheap; on wasm32
+// the acquire load in should_process() is an atomic load and slowed loop-heavy
+// code by up to 2.4x.
+#define DO_BACKEDGE_CHECKS(skip, branch_pc)                                    \
+    if ((skip) <= 0 &&                                                         \
+        (THREAD->poll_data()->_polling_word & SafepointMechanism::poll_bit()) && \
+        SafepointMechanism::should_process(THREAD)) {                          \
+      CALL_VM(at_safepoint(THREAD), handle_exception);                         \
+    }
 
 /*
  * For those opcodes that need to have a GC point on a backwards branch
