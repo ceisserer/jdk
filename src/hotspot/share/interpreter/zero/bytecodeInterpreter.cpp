@@ -32,6 +32,9 @@
 #include "interpreter/interpreter.hpp"
 #include "interpreter/interpreterRuntime.hpp"
 #include "interpreter/zero/bytecodeInterpreter.inline.hpp"
+#ifdef __EMSCRIPTEN__
+#include "wasmJit_zero.hpp"
+#endif
 #include "jvm_io.h"
 #include "logging/log.hpp"
 #include "memory/resourceArea.hpp"
@@ -315,7 +318,20 @@ JRT_END
         (THREAD->poll_data()->_polling_word & SafepointMechanism::poll_bit()) && \
         SafepointMechanism::should_process(THREAD)) {                          \
       CALL_VM(at_safepoint(THREAD), handle_exception);                         \
+    }                                                                          \
+    WASM_OSR_CHECK(skip)
+
+#ifdef __EMSCRIPTEN__
+// Experimental wasm32 compiler: on a hot backward branch, return to main_loop
+// to continue this frame in compiled code (pc is already the branch target).
+#define WASM_OSR_CHECK(skip)                                                   \
+    if ((skip) <= 0 && !WasmJit::disabled() && WasmJit::osr_check(METHOD)) {  \
+      istate->set_msg(do_osr);                                                 \
+      UPDATE_PC_AND_RETURN(0);                                                 \
     }
+#else
+#define WASM_OSR_CHECK(skip)
+#endif
 
 /*
  * For those opcodes that need to have a GC point on a backwards branch

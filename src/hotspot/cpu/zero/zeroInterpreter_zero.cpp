@@ -284,6 +284,14 @@ void ZeroInterpreter::main_loop(int recurse, TRAPS) {
       break;
     }
     else if (istate->msg() == BytecodeInterpreter::do_osr) {
+#ifdef __EMSCRIPTEN__
+      // Experimental wasm32 compiler: continue this frame in compiled code.
+      if (WasmJit::osr(thread, istate)) {
+        return;   // compiled code finished the method
+      }
+      istate->set_msg(BytecodeInterpreter::deopt_resume2);   // stay interpreted
+      continue;
+#endif
       // Unwind the current frame
       thread->pop_zero_frame();
 

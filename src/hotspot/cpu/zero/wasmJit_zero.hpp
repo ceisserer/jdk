@@ -23,6 +23,7 @@
 #include "memory/allStatic.hpp"
 #include "utilities/globalDefinitions.hpp"
 
+class BytecodeInterpreter;
 class JavaThread;
 class Method;
 
@@ -34,6 +35,13 @@ class WasmJit : AllStatic {
   static void initialize();
   // Called by ZeroInterpreter::normal_entry for every interpreted invocation.
   static void on_interpreted_invocation(Method* method, JavaThread* thread);
+  // Called by the interpreter on backward branches: true if it should stop and
+  // let main_loop try on-stack replacement (msg do_osr).
+  static inline bool osr_check(Method* method);
+  // Called by ZeroInterpreter::main_loop for do_osr: compile if needed and
+  // continue the current frame in compiled code. Returns true if the compiled
+  // code finished the method (frame popped, result pushed).
+  static bool osr(JavaThread* thread, BytecodeInterpreter* istate);
 
   // Offsets into the interpreter state used by generated code.
   static int istate_locals_offset();
@@ -43,9 +51,21 @@ class WasmJit : AllStatic {
   static bool _enabled;
   static bool _disabled;
   static int _threshold;
+  static int _osr_threshold;
   static bool _log;
   static void compile_and_install(Method* method, JavaThread* thread);
 };
+
+#include "oops/method.hpp"
+#include "oops/methodCounters.hpp"
+
+inline bool WasmJit::osr_check(Method* method) {
+  MethodCounters* mcs = method->method_counters();
+  if (mcs == nullptr) return false;
+  InvocationCounter* bc = mcs->backedge_counter();
+  bc->increment();
+  return (bc->count() % (uint) _osr_threshold) == 0;
+}
 
 #endif // __EMSCRIPTEN__
 #endif // CPU_ZERO_WASMJIT_ZERO_HPP

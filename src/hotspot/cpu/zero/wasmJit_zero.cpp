@@ -8,7 +8,9 @@
 #include "gc/shared/barrierSet.hpp"
 #include "gc/shared/cardTable.hpp"
 #include "gc/shared/cardTableBarrierSet.hpp"
+#include "interpreter/bytecode.hpp"
 #include "interpreter/bytecodeStream.hpp"
+#include "interpreter/interpreterRuntime.hpp"
 #include "interpreter/bytecodes.hpp"
 #include "interpreter/zero/bytecodeInterpreter.hpp"
 #include "interpreter/zero/zeroInterpreter.hpp"
@@ -16,6 +18,9 @@
 #include "memory/resourceArea.hpp"
 #include "memory/universe.hpp"
 #include "oops/arrayOop.hpp"
+#include "oops/klassVtable.hpp"
+#include "oops/objArrayKlass.hpp"
+#include "runtime/signature.hpp"
 #include "oops/constantPool.inline.hpp"
 #include "oops/cpCache.inline.hpp"
 #include "oops/method.inline.hpp"
@@ -23,6 +28,7 @@
 #include "oops/resolvedFieldEntry.hpp"
 #include "oops/resolvedMethodEntry.hpp"
 #include "prims/jvmtiExport.hpp"
+#include "runtime/arguments.hpp"
 #include "runtime/frame.inline.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
@@ -41,10 +47,21 @@
 bool WasmJit::_enabled = false;
 bool WasmJit::_disabled = false;
 int  WasmJit::_threshold = 1000;
+int  WasmJit::_osr_threshold = 10000;
 bool WasmJit::_log = false;
 static int  wasmjit_state = 0;          // 0: not initialized, 1: disabled, 2: enabled
 static const char* wasmjit_dir = "/tmp";
 static volatile int wasmjit_module_counter = 0;
+static int wasmjit_log_level = 0;           // WASM_JIT_LOG: 1 compilations/OSR, 2 also bailouts
+static int wasmjit_max_bailouts = 10000;    // WASM_JIT_MAX_BAILOUTS: then revert to the interpreter
+
+// The method's interpreter entry while it has Wasm code. Starts like a
+// ZeroEntry (entry_point), so the interpreter can call it unchanged.
+struct WasmJitEntry {
+  address entry_point;
+  address interp_entry;      // previous entry, restored on revert
+  volatile int bailouts;
+};
 
 int WasmJit::istate_locals_offset()      { return in_bytes(byte_offset_of(BytecodeInterpreter, _locals)); }
 int WasmJit::istate_stack_limit_offset() { return in_bytes(byte_offset_of(BytecodeInterpreter, _stack_limit)); }
@@ -54,8 +71,13 @@ void WasmJit::initialize() {
   _enabled = e != nullptr && strcmp(e, "0") != 0;
   const char* t = ::getenv("WASM_JIT_THRESHOLD");
   if (t != nullptr) _threshold = MAX2(1, atoi(t));
+  const char* o = ::getenv("WASM_JIT_OSR_THRESHOLD");
+  if (o != nullptr) _osr_threshold = MAX2(1, atoi(o));
   const char* l = ::getenv("WASM_JIT_LOG");
   _log = l != nullptr && strcmp(l, "0") != 0;
+  wasmjit_log_level = l != nullptr ? atoi(l) : 0;
+  const char* mb = ::getenv("WASM_JIT_MAX_BAILOUTS");
+  if (mb != nullptr) wasmjit_max_bailouts = atoi(mb);
   const char* d = ::getenv("WASM_JIT_DIR");
   if (d != nullptr) wasmjit_dir = d;
   wasmjit_state = _enabled ? 2 : 1;
@@ -113,7 +135,28 @@ extern "C" JNIEXPORT void wasmjit_return(JavaThread* thread, BytecodeInterpreter
 extern "C" JNIEXPORT void wasmjit_bailout(JavaThread* thread, BytecodeInterpreter* istate,
                                           int bci, intptr_t* tos, int with_exception) {
   istate->set_bcp(istate->method()->code_base() + bci);
-  istate->set_stack(tos);
+  if (tos != nullptr) istate->set_stack(tos);
+  if (wasmjit_log_level >= 2) {
+    ResourceMark rm(thread);
+    Method* m = istate->method();
+    fprintf(stderr, "[wasmjit] bailout %s bci %d (%s)%s\n", m->name_and_sig_as_C_string(), bci,
+            Bytecodes::name(Bytecodes::java_code(Bytecodes::code_at(m, m->code_base() + bci))),
+            with_exception ? " with exception" : "");
+  }
+  Method* bm = istate->method();
+  if (bm->is_not_c2_compilable() && wasmjit_max_bailouts > 0) {
+    // Compiled code that keeps bailing out is slower than the interpreter.
+    WasmJitEntry* e = (WasmJitEntry*) bm->from_interpreted_entry();
+    if (AtomicAccess::add(&e->bailouts, 1) == wasmjit_max_bailouts) {
+      bm->set_interpreter_entry(e->interp_entry);
+      bm->clear_is_not_c2_compilable();
+      if (wasmjit_log_level >= 1) {
+        ResourceMark rm(thread);
+        fprintf(stderr, "[wasmjit] reverted %s to the interpreter after %d bailouts\n",
+                bm->name_and_sig_as_C_string(), wasmjit_max_bailouts);
+      }
+    }
+  }
   istate->set_msg(with_exception ? BytecodeInterpreter::method_resume
                                  : BytecodeInterpreter::deopt_resume2);
   ZeroInterpreter::main_loop(0, thread);
@@ -134,14 +177,107 @@ extern "C" JNIEXPORT int wasmjit_safepoint(JavaThread* thread, BytecodeInterpret
   return thread->has_pending_exception() ? 1 : 0;
 }
 
+// OSR entry: compiled code continues the interpreter frame on top of the stack.
+extern "C" JNIEXPORT BytecodeInterpreter* wasmjit_osr_enter(JavaThread* thread) {
+  thread->set_last_Java_frame();
+  return thread->top_zero_frame()->as_interpreter_frame()->interpreter_state();
+}
+
+// Before a call: make the frame walkable at bci (expression stack including the
+// arguments), put the Zero stack pointer at the arguments and clear the frame
+// anchor (the callee sets its own), as ZeroInterpreter::main_loop does.
+extern "C" JNIEXPORT void wasmjit_pre_call(JavaThread* thread, BytecodeInterpreter* istate,
+                                           int bci, intptr_t* tos) {
+  istate->set_bcp(istate->method()->code_base() + bci);
+  istate->set_stack(tos);
+  thread->zero_stack()->set_sp(tos + 1);
+  thread->reset_last_Java_frame();
+}
+
+// After a call: restore the Zero stack pointer and the frame anchor. Returns 1
+// if an exception is pending.
+extern "C" JNIEXPORT int wasmjit_post_call(JavaThread* thread, BytecodeInterpreter* istate) {
+  thread->zero_stack()->set_sp(istate->stack_limit() + 1);
+  thread->set_last_Java_frame();
+  return thread->has_pending_exception() ? 1 : 0;
+}
+
+// Allocation through InterpreterRuntime (kind 0: new, 1: newarray, 2: anewarray).
+// Returns the object, or null with a pending exception.
+extern "C" JNIEXPORT oopDesc* wasmjit_new(JavaThread* thread, BytecodeInterpreter* istate, int bci,
+                                          intptr_t* tos, int kind, int index, int size) {
+  istate->set_bcp(istate->method()->code_base() + bci);
+  istate->set_stack(tos);
+  ConstantPool* cp = istate->method()->constants();
+  switch (kind) {
+    case 0:  InterpreterRuntime::_new(thread, cp, index); break;
+    case 1:  InterpreterRuntime::newarray(thread, (BasicType) index, size); break;
+    default: InterpreterRuntime::anewarray(thread, cp, index, size); break;
+  }
+  if (thread->has_pending_exception()) {
+    return nullptr;
+  }
+  oop result = thread->vm_result_oop();
+  thread->set_vm_result_oop(nullptr);
+  return result;
+}
+
+// _return_register_finalizer (the return of Object.<init>): register the
+// receiver if its class has a finalizer. Returns 1 if an exception is pending.
+extern "C" JNIEXPORT int wasmjit_register_finalizer(JavaThread* thread, BytecodeInterpreter* istate,
+                                                    int bci, intptr_t* tos) {
+  oop rcvr = cast_to_oop((void*) istate->locals()[0]);
+  if (!rcvr->klass()->has_finalizer()) return 0;
+  istate->set_bcp(istate->method()->code_base() + bci);
+  istate->set_stack(tos);
+  InterpreterRuntime::register_finalizer(thread, rcvr);
+  return thread->has_pending_exception() ? 1 : 0;
+}
+
+extern "C" JNIEXPORT int wasmjit_subtype(Klass* sub, Klass* super) {
+  return sub->is_subtype_of(super) ? 1 : 0;
+}
+
+// Target of an invokeinterface (mirrors BytecodeInterpreter). Returns null if
+// the call cannot proceed (the interpreter then throws the right error).
+extern "C" JNIEXPORT Method* wasmjit_interface_callee(oopDesc* rcvr, ResolvedMethodEntry* entry) {
+  Klass* rk = rcvr->klass();
+  if (entry->is_forced_virtual()) {
+    return entry->is_vfinal() ? entry->method() : (Method*) rk->method_at_vtable(entry->table_index());
+  }
+  if (entry->is_vfinal()) {
+    return rk->is_subtype_of(entry->interface_klass()) ? entry->method() : nullptr;
+  }
+  Method* interface_method = entry->method();
+  InstanceKlass* iclass = interface_method->method_holder();
+  if (!rk->is_instance_klass()) return nullptr;
+  InstanceKlass* ik = InstanceKlass::cast(rk);
+  Klass* refc = entry->interface_klass();
+  itableOffsetEntry* scan = (itableOffsetEntry*) ik->start_of_itable();
+  for (; scan->interface_klass() != nullptr; scan++) {
+    if (scan->interface_klass() == refc) break;
+  }
+  if (scan->interface_klass() == nullptr) return nullptr;
+  itableOffsetEntry* ki = (itableOffsetEntry*) ik->start_of_itable();
+  int i;
+  for (i = 0; i < ik->itable_length(); i++, ki++) {
+    if (ki->interface_klass() == iclass) break;
+  }
+  if (i == ik->itable_length()) return nullptr;
+  itableMethodEntry* im = ki->first_method_entry(rk);
+  return im[interface_method->itable_index()].method();
+}
+
 // ---------------------------------------------------------------------------
 // Compiler
 
 class WasmJitCompiler : public StackObj {
  public:
   // imported helper functions (function indices) and their types
-  enum { H_enter, H_return, H_bailout, H_safepoint, H_count };
-  enum { T_entry, T_enter, T_return, T_bailout, T_safepoint, T_void_i32, T_count };
+  enum { H_enter, H_return, H_bailout, H_safepoint, H_pre_call, H_post_call, H_new, H_subtype,
+         H_icallee, H_osr_enter, H_finalizer, H_count };
+  enum { T_entry, T_enter, T_return, T_bailout, T_safepoint, T_void_i32, T_pre_call, T_post_call,
+         T_new, T_i32x2, T_i32x1, T_count };
   // wasm locals of the generated function
   enum { L_method = 0, L_basepc, L_thread,                 // params
          L_istate, L_lbase, L_slow, L_bb, L_i0, L_i1,       // i32
@@ -149,6 +285,9 @@ class WasmJitCompiler : public StackObj {
          L_f0, L_f1,                                        // f32
          L_d0, L_d1 };                                      // f64
   enum Flow { FALL, COND, JUMP, END };
+  // extra branch targets of a switch (besides the default in out_target)
+  int _switch_targets[257];
+  int _nswitch;
 
  private:
   methodHandle _m;
@@ -178,7 +317,7 @@ class WasmJitCompiler : public StackObj {
   const char* failure() const { return _fail; }
 
   WasmJitCompiler(const methodHandle& m) : _m(m), _method(m()), _emit(false), _c(nullptr),
-                                           _cur(0), _extra(0), _fail(nullptr), _bail_sites(0) {
+                                           _cur(0), _extra(0), _nswitch(0), _fail(nullptr), _bail_sites(0) {
     _cp = _method->constants();
     _cache = _cp->cache();
     _code_size = _method->code_size();
@@ -262,7 +401,7 @@ class WasmJitCompiler : public StackObj {
       if (_emit) { _c->u8(OP_br); _c->uleb(j - (_cur + 1) + _extra); }
     } else {
       poll(target_bci, target_depth);
-      i32c(j); lset(L_bb);
+      i32c(target_bci); lset(L_bb);
       if (_emit) { _c->u8(OP_br); _c->uleb(_nblocks - 1 - _cur + _extra); }
     }
   }
@@ -281,6 +420,10 @@ class WasmJitCompiler : public StackObj {
   Flow gen(BytecodeStream& bs, int D, int& out_depth, int& out_target);
 
   bool analyze();
+  // Stack depth after a bytecode the compiler bails out at, so the code
+  // after it stays compiled (reachable through branches and OSR); -1 if
+  // unknown or if the bytecode does not fall through.
+  int depth_after(BytecodeStream& bs, int D);
   bool emit_function(WasmBuf& body);
   bool compile(WasmBuf& module);
 };
@@ -295,7 +438,7 @@ WasmJitCompiler::Flow WasmJitCompiler::gen(BytecodeStream& bs, int D, int& nd, i
   target = -1;
   nd = D;
 
-#define BAIL() { bail(bci, D, 0); return END; }
+#define BAIL() { bail(bci, D, 0); nd = depth_after(bs, D); return nd >= 0 ? FALL : END; }
 
   switch (code) {
     case Bytecodes::_nop: return FALL;
@@ -511,7 +654,10 @@ WasmJitCompiler::Flow WasmJitCompiler::gen(BytecodeStream& bs, int D, int& nd, i
     // ---- returns
     case Bytecodes::_ireturn: case Bytecodes::_freturn: case Bytecodes::_areturn:
     case Bytecodes::_lreturn: case Bytecodes::_dreturn: case Bytecodes::_return: {
-      if (raw == Bytecodes::_return_register_finalizer) BAIL();
+      if (raw == Bytecodes::_return_register_finalizer) {
+        lget(L_thread); lget(L_istate); i32c(bci); tos(D); call(H_finalizer);
+        if_(); bail(bci, D, 1); end();
+      }
       int slots = (code == Bytecodes::_return) ? 0 : (code == Bytecodes::_lreturn || code == Bytecodes::_dreturn) ? 2 : 1;
       lget(L_thread); lget(L_istate); tos(D); i32c(slots); call(H_return);
       i32c(0); op(OP_return);
@@ -545,6 +691,28 @@ WasmJitCompiler::Flow WasmJitCompiler::gen(BytecodeStream& bs, int D, int& nd, i
       if (sz == 3) { mem(OP_i64_store, soff(D - 1)); }                                // two slots replace arr, index
       else         { mem(OP_i32_store, soff(D - 2)); nd = D - 1; }
       return FALL;
+    }
+    case Bytecodes::_aastore: {
+      if (!_card_barrier || Arguments::is_valhalla_enabled()) BAIL();
+      int a = D - 3, ix = D - 2, v = D - 1;
+      sld32(a); op(OP_i32_eqz); bail_if(bci, D);
+      sld32(ix); sld32(a); mem(OP_i32_load, arrayOopDesc::length_offset_in_bytes());
+      op(OP_i32_ge_u); bail_if(bci, D);
+      sld32(v);
+      if_();   // non-null value: check assignability (ArrayStoreException in the interpreter)
+        sld32(v); mem(OP_i32_load, oopDesc::klass_offset_in_bytes()); ltee(L_i0);
+        sld32(a); mem(OP_i32_load, oopDesc::klass_offset_in_bytes()); mem(OP_i32_load, in_bytes(ObjArrayKlass::element_klass_offset()));
+        ltee(L_i1); op(OP_i32_ne);
+        if_();
+          lget(L_i0); lget(L_i1); call(H_subtype); op(OP_i32_eqz); bail_if(bci, D);
+        end();
+      end();
+      sld32(a); sld32(ix); i32c(2); op(OP_i32_shl); op(OP_i32_add);
+      i32c(arrayOopDesc::base_offset_in_bytes(T_OBJECT)); op(OP_i32_add); ltee(L_i0);
+      sld32(v); mem(OP_i32_store, 0);
+      lget(L_i0); i32c(_card_shift); op(OP_i32_shr_u); i32c((int) _card_base); op(OP_i32_add);
+      i32c(CardTable::dirty_card_val()); mem(OP_i32_store8, 0);
+      nd = D - 3; return FALL;
     }
     case Bytecodes::_iastore: case Bytecodes::_fastore: case Bytecodes::_bastore:
     case Bytecodes::_castore: case Bytecodes::_sastore: case Bytecodes::_lastore: case Bytecodes::_dastore: {
@@ -652,10 +820,157 @@ WasmJitCompiler::Flow WasmJitCompiler::gen(BytecodeStream& bs, int D, int& nd, i
       return FALL;
     }
 
+    // ---- calls
+    case Bytecodes::_invokestatic: case Bytecodes::_invokespecial:
+    case Bytecodes::_invokevirtual: case Bytecodes::_invokeinterface: {
+      if (raw == Bytecodes::_invokehandle) BAIL();
+      int index = Bytes::get_native_u2(bcp + 1);
+      ResolvedMethodEntry* e = _cache->resolved_method_entry_at(index);
+      if (!e->is_resolved(code) || e->has_appendix()) BAIL();
+      int P = e->number_of_parameters();
+      TosState ts = (TosState) e->tos_state();
+      int R = ts == vtos ? 0 : slots_of(ts);
+      int rslot = D - P;
+      if (code != Bytecodes::_invokestatic) { sld32(rslot); op(OP_i32_eqz); bail_if(bci, D); }
+      if (code == Bytecodes::_invokeinterface) {
+        sld32(rslot); i32c((int)(intptr_t) e); call(H_icallee); ltee(L_i0);
+        op(OP_i32_eqz); bail_if(bci, D);
+      } else if (code == Bytecodes::_invokevirtual && !e->is_vfinal()) {
+        sld32(rslot); mem(OP_i32_load, oopDesc::klass_offset_in_bytes());
+        mem(OP_i32_load, in_bytes(Klass::vtable_start_offset()) + e->table_index() * vtableEntry::size_in_bytes()
+                         + in_bytes(vtableEntry::method_offset()));
+        lset(L_i0);
+      } else {
+        i32c((int)(intptr_t) e->method()); lset(L_i0);
+      }
+      lget(L_thread); lget(L_istate); i32c(bci); tos(D); call(H_pre_call);
+      // callee->_from_interpreted_entry is a ZeroEntry; its first word is the entry function
+      lget(L_i0);
+      lget(L_i0); mem(OP_i32_load, in_bytes(Method::from_interpreted_offset())); ltee(L_i1);
+      lget(L_thread);
+      lget(L_i1); mem(OP_i32_load, 0);
+      if (_emit) { _c->u8(OP_call_indirect); _c->uleb(T_entry); _c->uleb(0); }
+      op(OP_drop);
+      lget(L_thread); lget(L_istate); call(H_post_call);
+      if_(); bail(bci, D - P, 1); end();
+      nd = D - P + R;
+      return FALL;
+    }
+
+    // ---- allocation
+    case Bytecodes::_new: case Bytecodes::_newarray: case Bytecodes::_anewarray: {
+      int kind = code == Bytecodes::_new ? 0 : code == Bytecodes::_newarray ? 1 : 2;
+      int index = code == Bytecodes::_newarray ? bcp[1] : Bytes::get_Java_u2(bcp + 1);
+      lget(L_thread); lget(L_istate); i32c(bci); tos(D); i32c(kind); i32c(index);
+      if (kind == 0) i32c(0); else sld32(D - 1);
+      call(H_new); ltee(L_i0);
+      op(OP_i32_eqz); if_(); bail(bci, D, 1); end();
+      int res = kind == 0 ? D : D - 1;
+      lget(L_slow); lget(L_i0); mem(OP_i32_store, soff(res));
+      nd = res + 1;
+      return FALL;
+    }
+
+    // ---- type checks against a resolved class
+    case Bytecodes::_checkcast: case Bytecodes::_instanceof: {
+      int index = Bytes::get_Java_u2(bcp + 1);
+      if (!_cp->tag_at(index).is_klass()) BAIL();
+      int k = (int)(intptr_t) _cp->resolved_klass_at(index);
+      if (code == Bytecodes::_checkcast) {
+        sld32(D - 1);
+        if_();
+          sld32(D - 1); mem(OP_i32_load, oopDesc::klass_offset_in_bytes()); ltee(L_i0); i32c(k); op(OP_i32_ne);
+          if_();
+            lget(L_i0); i32c(k); call(H_subtype); op(OP_i32_eqz); bail_if(bci, D);   // ClassCastException
+          end();
+        end();
+      } else {
+        sld32(D - 1); lset(L_i1);
+        lget(L_slow);
+        lget(L_i1); op(OP_i32_eqz);
+        if_i32();
+          i32c(0);
+        else_();
+          lget(L_i1); mem(OP_i32_load, oopDesc::klass_offset_in_bytes()); ltee(L_i0); i32c(k); op(OP_i32_eq);
+          if_i32(); i32c(1); else_(); lget(L_i0); i32c(k); call(H_subtype); end();
+        end();
+        mem(OP_i32_store, soff(D - 1));
+      }
+      return FALL;
+    }
+
+    // ---- switches: compare chain (keys and targets are known at compile time)
+    case Bytecodes::_tableswitch: case Bytecodes::_lookupswitch: {
+      int n, def;
+      int keys[256], dests[256];
+      if (code == Bytecodes::_tableswitch) {
+        Bytecode_tableswitch sw(_method, bcp);
+        n = sw.length();
+        if (n > 256) BAIL();
+        for (int i = 0; i < n; i++) { keys[i] = sw.low_key() + i; dests[i] = bci + sw.dest_offset_at(i); }
+        def = bci + sw.default_offset();
+      } else {
+        Bytecode_lookupswitch sw(_method, bcp);
+        n = sw.number_of_pairs();
+        if (n > 256) BAIL();
+        for (int i = 0; i < n; i++) { LookupswitchPair p = sw.pair_at(i); keys[i] = p.match(); dests[i] = bci + p.offset(); }
+        def = bci + sw.default_offset();
+      }
+      nd = D - 1;
+      _nswitch = n;
+      for (int i = 0; i < n; i++) {
+        _switch_targets[i] = dests[i];
+        sld32(D - 1); i32c(keys[i]); op(OP_i32_eq); cond_jump(dests[i], nd);
+      }
+      target = def;
+      jump(def, nd);
+      return JUMP;
+    }
+
     default:
       BAIL();
   }
 #undef BAIL
+}
+
+int WasmJitCompiler::depth_after(BytecodeStream& bs, int D) {
+  Bytecodes::Code code = bs.code();
+  address bcp = bs.bcp();
+  switch (code) {
+    case Bytecodes::_getfield: case Bytecodes::_putfield:
+    case Bytecodes::_getstatic: case Bytecodes::_putstatic: {
+      ResolvedFieldEntry* e = _cache->resolved_field_entry_at(Bytes::get_native_u2(bcp + 1));
+      Symbol* sig = _cp->uncached_signature_ref_at(e->constant_pool_index());
+      int n = type2size[Signature::basic_type(sig)];
+      switch (code) {
+        case Bytecodes::_getfield:  return D - 1 + n;
+        case Bytecodes::_getstatic: return D + n;
+        case Bytecodes::_putfield:  return D - 1 - n;
+        default:                    return D - n;
+      }
+    }
+    case Bytecodes::_invokestatic: case Bytecodes::_invokespecial:
+    case Bytecodes::_invokevirtual: case Bytecodes::_invokeinterface: {
+      ResolvedMethodEntry* e = _cache->resolved_method_entry_at(Bytes::get_native_u2(bcp + 1));
+      Symbol* sig = _cp->uncached_signature_ref_at(e->constant_pool_index());
+      ArgumentSizeComputer asc(sig);
+      int P = asc.size() + (code == Bytecodes::_invokestatic ? 0 : 1);
+      return D - P + type2size[asc.return_type()];
+    }
+    case Bytecodes::_multianewarray: return D - bcp[3] + 1;
+    case Bytecodes::_ldc: case Bytecodes::_ldc_w: return D + 1;
+    case Bytecodes::_ldc2_w: return D + 2;
+    case Bytecodes::_invokedynamic: case Bytecodes::_athrow: case Bytecodes::_jsr: case Bytecodes::_jsr_w:
+    case Bytecodes::_ret: case Bytecodes::_ireturn: case Bytecodes::_lreturn: case Bytecodes::_freturn:
+    case Bytecodes::_dreturn: case Bytecodes::_areturn: case Bytecodes::_return:
+    case Bytecodes::_tableswitch: case Bytecodes::_lookupswitch:
+      return -1;
+    default: {
+      int d = Bytecodes::depth(code);
+      int r = D + d;
+      return (r >= 0 && r <= _max_stack) ? r : -1;
+    }
+  }
 }
 
 bool WasmJitCompiler::analyze() {
@@ -677,8 +992,17 @@ bool WasmJitCompiler::analyze() {
           leader[bs.dest()] = true; leader[next] = true; break;
         case Bytecodes::_goto_w:
           leader[bs.dest_w()] = true; leader[next] = true; break;
+        case Bytecodes::_tableswitch: {
+          Bytecode_tableswitch sw(_method, bs.bcp());
+          for (int i = 0; i < sw.length(); i++) leader[bs.bci() + sw.dest_offset_at(i)] = true;
+          leader[bs.bci() + sw.default_offset()] = true; leader[next] = true; break;
+        }
+        case Bytecodes::_lookupswitch: {
+          Bytecode_lookupswitch sw(_method, bs.bcp());
+          for (int i = 0; i < sw.number_of_pairs(); i++) leader[bs.bci() + sw.pair_at(i).offset()] = true;
+          leader[bs.bci() + sw.default_offset()] = true; leader[next] = true; break;
+        }
         case Bytecodes::_jsr: case Bytecodes::_jsr_w: case Bytecodes::_ret:
-        case Bytecodes::_tableswitch: case Bytecodes::_lookupswitch:
         case Bytecodes::_ireturn: case Bytecodes::_lreturn: case Bytecodes::_freturn:
         case Bytecodes::_dreturn: case Bytecodes::_areturn: case Bytecodes::_return:
         case Bytecodes::_athrow:
@@ -696,7 +1020,7 @@ bool WasmJitCompiler::analyze() {
   for (int b = 0; b < _nblocks; b++) _block_depth[b] = -1;
 
   // 2. expression stack depth at every reachable bytecode (worklist)
-  int* work = NEW_RESOURCE_ARRAY(int, _nblocks * 2 + 4);
+  int* work = NEW_RESOURCE_ARRAY(int, _nblocks * 2 + 4);   // each block is pushed at most once
   int nwork = 0;
   _block_depth[0] = 0;
   work[nwork++] = 0;
@@ -711,7 +1035,13 @@ bool WasmJitCompiler::analyze() {
     while ((c = bs.next()) >= 0) {
       _depth[bs.bci()] = D;
       int nd, target;
+      _nswitch = 0;
       f = gen(bs, D, nd, target);
+      for (int i = 0; i < _nswitch; i++) {
+        int tb = _block_of[_switch_targets[i]];
+        if (_block_depth[tb] < 0) { _block_depth[tb] = nd; work[nwork++] = tb; }
+        else if (_block_depth[tb] != nd) { _fail = "inconsistent stack depth"; return false; }
+      }
       if (f == COND || f == JUMP) {
         int tb = _block_of[target];
         if (_block_depth[tb] < 0) { _block_depth[tb] = nd; work[nwork++] = tb; }
@@ -737,25 +1067,38 @@ bool WasmJitCompiler::emit_function(WasmBuf& body) {
   _c = &code;
   _emit = true;
   _extra = 0;
-  // prologue: build the interpreter frame
-  lget(L_method); lget(L_thread); call(H_enter); ltee(L_istate);
-  op(OP_i32_eqz); if_(); i32c(0); op(OP_return); end();
+  // prologue. base_pc < 0: OSR, continue the interpreter frame on top of the
+  // stack at bci = -(base_pc + 1); otherwise build a new frame.
+  lget(L_basepc); i32c(0); op(OP_i32_lt_s);
+  if_();
+    lget(L_thread); call(H_osr_enter); lset(L_istate);
+    lget(L_basepc); i32c(-1); op(OP_i32_xor); lset(L_bb);
+  else_();
+    lget(L_method); lget(L_thread); call(H_enter); ltee(L_istate);
+    op(OP_i32_eqz); if_(); i32c(0); op(OP_return); end();
+    i32c(0); lset(L_bb);
+  end();
   lget(L_istate); mem(OP_i32_load, WasmJit::istate_locals_offset()); i32c(4 * (_max_locals - 1)); op(OP_i32_sub); lset(L_lbase);
   lget(L_istate); mem(OP_i32_load, WasmJit::istate_stack_limit_offset()); i32c(4); op(OP_i32_add); lset(L_slow);
-  i32c(0); lset(L_bb);
-  // dispatch: loop { block_{n-1} ... block_0 { br_table } code_0 } code_1 ... code_{n-1} }
+  // dispatch on bci: loop { block_{n-1} ... block_0 { br_table } code_0 } code_1 ... code_{n-1} }
   op(OP_loop); code.u8(0x40);
   for (int b = 0; b < _nblocks; b++) { op(OP_block); code.u8(0x40); }
   lget(L_bb);
-  op(OP_br_table); code.uleb(_nblocks);
-  for (int b = 0; b < _nblocks; b++) code.uleb(b);
+  op(OP_br_table); code.uleb(_code_size);
+  for (int bci = 0; bci < _code_size; bci++) code.uleb(_block_of[bci] >= 0 ? _block_of[bci] : 0);
   code.uleb(0);
   for (int b = 0; b < _nblocks; b++) {
     op(OP_end);                       // end of block_b: code of block b follows
     _cur = b;
     _extra = 0;
     int D = _block_depth[b];
-    if (D < 0) { op(OP_unreachable); continue; }
+    if (D < 0) {
+      // Not reachable from the method entry in compiled code (depth unknown),
+      // but an OSR may land here: return to the interpreter, keeping its tos.
+      lget(L_thread); lget(L_istate); i32c(_block_start[b]); i32c(0); i32c(0); call(H_bailout);
+      i32c(0); op(OP_return);
+      continue;
+    }
     BytecodeStream bs(_m);
     bs.set_interval(_block_start[b], _block_start[b + 1]);
     Bytecodes::Code c;
@@ -804,15 +1147,28 @@ bool WasmJitCompiler::compile(WasmBuf& module) {
     fn(5, 0);   // T_bailout   (thread, istate, bci, tos, with_exception)
     fn(4, 1);   // T_safepoint (thread, istate, bci, tos) -> pending exception
     fn(0, 1);   // T_void_i32  _emscripten_tls_init
+    fn(4, 0);   // T_pre_call  (thread, istate, bci, tos)
+    fn(2, 1);   // T_post_call (thread, istate) -> pending exception
+    fn(7, 1);   // T_new       (thread, istate, bci, tos, kind, index, size) -> oop
+    fn(2, 1);   // T_i32x2     subtype(sub, super), interface_callee(rcvr, entry)
+    fn(1, 1);   // T_i32x1     osr_enter(thread) -> istate
     module.section(1, s);
   }
   { // imports
-    WasmBuf s; s.uleb(1 + H_count);
+    WasmBuf s; s.uleb(2 + H_count);
     s.str("env"); s.str("memory"); s.u8(2); s.u8(0x03); s.uleb(1); s.uleb(65536);   // shared memory
+    s.str("env"); s.str("__indirect_function_table"); s.u8(1); s.u8(0x70); s.u8(0x00); s.uleb(0);  // for call_indirect
     s.str("env"); s.str("wasmjit_enter");     s.u8(0); s.uleb(T_enter);
     s.str("env"); s.str("wasmjit_return");    s.u8(0); s.uleb(T_return);
     s.str("env"); s.str("wasmjit_bailout");   s.u8(0); s.uleb(T_bailout);
     s.str("env"); s.str("wasmjit_safepoint"); s.u8(0); s.uleb(T_safepoint);
+    s.str("env"); s.str("wasmjit_pre_call");  s.u8(0); s.uleb(T_pre_call);
+    s.str("env"); s.str("wasmjit_post_call"); s.u8(0); s.uleb(T_post_call);
+    s.str("env"); s.str("wasmjit_new");       s.u8(0); s.uleb(T_new);
+    s.str("env"); s.str("wasmjit_subtype");   s.u8(0); s.uleb(T_i32x2);
+    s.str("env"); s.str("wasmjit_interface_callee"); s.u8(0); s.uleb(T_i32x2);
+    s.str("env"); s.str("wasmjit_osr_enter"); s.u8(0); s.uleb(T_i32x1);
+    s.str("env"); s.str("wasmjit_register_finalizer"); s.u8(0); s.uleb(T_safepoint);   // same type
     module.section(2, s);
   }
   // functions: the compiled method and _emscripten_tls_init (required from
@@ -880,15 +1236,52 @@ void WasmJit::compile_and_install(Method* method, JavaThread* thread) {
   if (op.fn() == nullptr) {
     return;
   }
-  ZeroEntry* entry = (ZeroEntry*) os::malloc(sizeof(ZeroEntry), mtCode);
-  entry->set_entry_point((address) op.fn());
+  WasmJitEntry* entry = (WasmJitEntry*) os::malloc(sizeof(WasmJitEntry), mtCode);
+  entry->entry_point = (address) op.fn();
+  entry->interp_entry = method->interpreter_entry();
+  entry->bailouts = 0;
   method->set_interpreter_entry((address) entry);
+  method->set_is_not_c2_compilable();   // marker: has Wasm code (see wasm_entry_of)
   if (_log) {
     fprintf(stderr, "[wasmjit] %s: %d bytes bytecode -> %d bytes wasm, %d blocks, %d bailout sites, "
                     "compile %.2f ms, load %.2f ms\n",
             method->name_and_sig_as_C_string(), method->code_size(), module.length(), c.nblocks(),
             c.bail_sites(), (t1 - t0) / 1e6, (t2 - t1) / 1e6);
   }
+}
+
+static address wasm_entry_of(Method* method) {
+  if (!method->is_not_c2_compilable()) return nullptr;
+  return ((ZeroEntry*) method->from_interpreted_entry())->entry_point();
+}
+
+bool WasmJit::osr(JavaThread* thread, BytecodeInterpreter* istate) {
+  Method* method = istate->method();
+  address fn = wasm_entry_of(method);
+  if (fn == nullptr) {
+    if (method->is_not_c1_compilable() || method->is_synchronized() ||
+        JvmtiExport::can_post_interpreter_events()) {
+      return false;
+    }
+    method->set_is_not_c1_compilable();   // compile at most once
+    // The frame was decached (bcp, tos) by the interpreter; make it walkable.
+    thread->set_last_Java_frame();
+    {
+      ThreadInVMfromJava tiv(thread);
+      compile_and_install(method, thread);
+    }
+    thread->reset_last_Java_frame();
+    fn = wasm_entry_of(method);
+    if (fn == nullptr) return false;
+  }
+  int bci = istate->bcp() - method->code_base();
+  if (_log) {
+    ResourceMark rm(thread);
+    fprintf(stderr, "[wasmjit] OSR %s at bci %d\n", method->name_and_sig_as_C_string(), bci);
+  }
+  typedef int (*entry_t)(Method*, intptr_t, JavaThread*);
+  ((entry_t) fn)(method, -(bci + 1), thread);
+  return true;
 }
 
 void WasmJit::on_interpreted_invocation(Method* method, JavaThread* thread) {

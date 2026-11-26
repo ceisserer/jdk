@@ -50,6 +50,12 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
   - `src/hotspot/share/interpreter/zero/bytecodeInterpreter.cpp`: safepoint
     polls on backward branches (upstream Zero bug fix, not guarded; affects all
     Zero platforms).
+  - `src/hotspot/cpu/zero/wasmJit_zero.{hpp,cpp}`, `wasmEmitter_zero.hpp`:
+    experimental baseline compiler (bytecode to Wasm), off unless `WASM_JIT=1`;
+    hooks in `zeroInterpreter_zero.cpp` (`normal_entry` counts invocations,
+    `main_loop` handles `do_osr`) and `bytecodeInterpreter.{hpp,cpp}` (friend
+    for frame offsets, OSR request on hot backward branches). See the section
+    "Baseline compiler" below.
   - `src/hotspot/cpu/zero/wasmJitSpike_zero.{hpp,cpp}` + hook in
     `src/hotspot/share/oops/method.cpp`: experimental runtime code installation,
     off unless `WASM_JIT_SPIKE` is set (see `wasm/spike/README.md`).
@@ -249,6 +255,67 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
   - pthreads + `ALLOW_MEMORY_GROWTH` overhead (`growMemViews`): about 0.8 s.
   - `memset` of reservations: about 0.4 s.
 
+## Baseline compiler (experimental, `WASM_JIT=1`)
+
+Environment variables: `WASM_JIT=1` enables it; `WASM_JIT_THRESHOLD` (default
+1000 interpreted invocations), `WASM_JIT_OSR_THRESHOLD` (default 10000 backward
+branches), `WASM_JIT_LOG=1` (compilations, OSR, reverts) or `2` (also every
+bailout), `WASM_JIT_MAX_BAILOUTS` (default 10000, then the method is reverted
+to the interpreter), `WASM_JIT_DIR` (default `/tmp`, generated modules are
+deleted after loading).
+
+Design (`wasmJit_zero.cpp`):
+- One Wasm function per method with the Zero entry ABI, in an Emscripten side
+  module (dylink.0, imports `env.memory`, `env.__indirect_function_table` and
+  the `wasmjit_*` helpers by name, exports `wasmjit_entry` and
+  `_emscripten_tls_init`), written to a file and loaded with `dlopen` in a VM
+  operation at a safepoint.
+- Compiled code creates a real interpreter frame (`wasmjit_enter`) and keeps
+  locals and the expression stack in it; the stack depth is known statically
+  per bytecode, so every slot is a load/store at a constant offset. GC, stack
+  walking and exceptions see an ordinary interpreter frame.
+- Control flow: blocks as nested Wasm `block`s with a `br_table` dispatch
+  indexed by bci; forward branches are direct `br`s, backward branches set the
+  bci, poll for safepoints and go through the dispatch.
+- Calls: `wasmjit_pre_call` / `call_indirect` through the callee's ZeroEntry /
+  `wasmjit_post_call`, as `main_loop` does. Static/special/final calls use the
+  `Method*` from the resolved entry, virtual calls the vtable, interface calls
+  `wasmjit_interface_callee`.
+- Bailout: unsupported bytecodes, unresolved constant pool entries and
+  exceptional paths (null, bounds, division by zero, failed type checks) hand
+  the frame to the interpreter at that bci (`deopt_resume2`, or
+  `method_resume` with a pending exception) and the interpreter finishes the
+  method. The analysis continues past bailing bytecodes (stack effect from
+  `Bytecodes::depth` or signatures), so later blocks stay compiled.
+- OSR: the interpreter counts backward branches (`WasmJit::osr_check`) and
+  returns `do_osr` to `main_loop`, which calls the compiled function with
+  `base_pc = -(bci + 1)`: it continues the existing frame at that bci.
+- Not compiled yet (bailout): `invokedynamic`, `ldc` of String/Class,
+  `athrow`, monitors, `multianewarray`, `frem`/`drem`, `jsr`/`ret`, method
+  handle calls, synchronized methods.
+- Tests: `wasm/test/JitTest.java` (checksum must match the interpreter and
+  native HotSpot), Hello, `Bench` (checksums).
+
+Results (`Bench`, ms, interpreter vs compiler with OSR): intLoop 48 / 35,
+fields 58 / 31, calls 192 / 151, sieve 30 / 36, alloc 241 / 261, longDouble
+90 / 24, strings 1841 / 1616, total 2500 / 2154. The compiler numbers include
+about 1 s of module loading (71 modules, about 14 ms each) inside the timed
+kernels.
+
+Pitfalls found while building it:
+- Every side module must export `_emscripten_tls_init` when pthreads are used
+  ("TypeError: tlsInitFunc is not a function"); returning 0 means no TLS.
+- Wasm memory instructions reject alignment hints larger than the access width
+  (8/16-bit accesses need 0/1).
+- `Object.<init>` ends in `_return_register_finalizer`; bailing there made
+  every allocation slower than interpreted (600k bailouts in Bench). It now
+  calls `wasmjit_register_finalizer`.
+- If the analysis stops at the first unsupported bytecode, everything after it
+  is dead, and OSR into such a loop bails at once on every attempt (seen with
+  array initializers before a loop: `aastore`).
+- Compiled code that keeps bailing is slower than the interpreter: the method
+  is reverted after `WASM_JIT_MAX_BAILOUTS`.
+
 ## Interpreter speed (CPU benchmark `wasm/test/Bench.java`, ms, 4 cores)
 
 | Kernel | HotSpot JIT | HotSpot `-Xint` | Zero native | Zero wasm |
@@ -275,9 +342,15 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 
 ## Next steps
 
-1. Bytecode-to-Wasm baseline compiler emitting side modules in the spike's
-   format (Zero entry ABI, frames in Zero layout, loaded at a safepoint, several
-   methods per module); compiled callers calling compiled callees directly.
+1. Baseline compiler follow-ups:
+   - batch several methods per module and load them together (each `dlopen`
+     costs about 6 to 30 ms, growing with the number of loaded modules);
+   - cheaper calls: inline frame setup/teardown instead of the
+     `wasmjit_enter`/`return`/`pre_call`/`post_call` helpers, and direct calls
+     between compiled methods;
+   - keep values in Wasm locals between safepoints instead of memory;
+   - inline allocation fast path (TLAB), `invokedynamic`/String `ldc`, monitors;
+   - store generated code in the AOT cache (no compile or load at startup).
 2. Reduce the cost per worker (each loads all of `java.js`/`java.wasm`): a smaller
    module (the `MAIN_MODULE=1` GOT/table setup took about 35 ms on the main
    thread), and fewer HotSpot threads at startup.
