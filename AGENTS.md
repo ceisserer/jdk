@@ -39,6 +39,12 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
   - `waitBarrier.hpp`, `waitBarrier_linux.cpp`, `systemMemoryBarrier_linux.cpp`:
     no futex or membarrier syscalls.
   - `src/hotspot/share/cds/aotMetaspace.hpp`: read CDS regions instead of mmap.
+  - `src/hotspot/share/utilities/macros.hpp`: `INCLUDE_CDS_JAVA_HEAP` also on
+    Emscripten (archived heap objects, otherwise 64-bit only).
+  - `src/hotspot/share/cds/aotMetaspace.cpp`: set up archived-heap loading also
+    without class space.
+  - `src/hotspot/share/cds/aotStreamedHeapLoader.cpp`: 32-bit fixes (klass
+    decoding, pointer-sized references, klass word not copied).
   - `src/java.base/unix/native/libnio/fs/UnixNativeDispatcher.c`: bind
     `openat`/`fstatat`/`fdopendir` directly.
   - `src/java.base/share/classes/jdk/internal/util/Architecture.java` and
@@ -58,7 +64,8 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
   (`wasm/env.sh` unsets them).
 - Order: `wasm/build-libffi.sh`, `wasm/configure.sh`, `wasm/build.sh`,
   `wasm/link.sh`, `wasm/image.sh`, `wasm/run.sh -version`. Optionally
-  `wasm/cds.sh app.jsa -cp app.jar Main` for a CDS archive.
+  `wasm/aot.sh app.aot -cp app.jar Main` for an AOT cache (preferred) or
+  `wasm/cds.sh app.jsa -cp app.jar Main` for a classic CDS archive.
 - `wasm/run.sh` uses the jlinked image (`build/<conf>/wasm-image`) as `JAVA_HOME`
   when it exists, otherwise the exploded build (`build/<conf>/jdk`).
 - To see every compile error at once instead of stopping at the first:
@@ -67,8 +74,9 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 - To rebuild one HotSpot object fast, re-run the command in
   `failure-logs/*.cmdline`.
 - Verification state: the full chain (configure → build → link → image → CDS
-  dump → `java -version` and `Hello` with the archive) runs on this branch (JDK 28
-  mainline). Without the image and CDS it was earlier also verified on jdk25u.
+  archive / AOT cache → `java -version` and `Hello` with the archive or cache)
+  runs on this branch (JDK 28 mainline). Without image, CDS and AOT cache it was
+  earlier also verified on jdk25u.
 - Smoke test: `javac -d /tmp/hello wasm/test/Hello.java && wasm/run.sh -cp /tmp/hello Hello`.
   It should print `thread sum = 10` and end with `gc ok`.
 
@@ -129,13 +137,31 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
     on Emscripten (the Windows path, which `read()`s the regions into the
     reserved space). The log line "Mapped static region" is printed either way.
 15. **CDS rejects directories on the classpath** ("non-empty directory"); package
-    the application as a JAR. On wasm32 there are no archived heap objects
-    ("initial full module graph: disabled"); the archive holds class metadata only.
-16. **CDS vs AOT cache:** the JDK 24+ "AOT cache" (`-XX:AOTCacheOutput`, Leyden) is
-    CDS extended with linked classes, resolved invokedynamic sites, method profiles
-    and (newer) compiled code. For Zero only the CDS part plus class linking and
-    resolved call sites help; profiles and compiled code need a JIT. "AOT code" in
-    the next steps means a future Wasm code tier, not this cache.
+    the application as a JAR.
+16. **CDS vs AOT cache:** the JDK 24+ "AOT cache" (Leyden) is CDS extended with
+    linked classes, resolved invokedynamic sites, method profiles and (newer)
+    compiled code. For Zero only the CDS part plus class linking and resolved call
+    sites help; profiles and compiled code need a JIT. "AOT code" in the next
+    steps means a future Wasm code tier, not this cache. Use the two-step
+    workflow (`AOTMode=record`, then `create`; `wasm/aot.sh`): one-step
+    `-XX:AOTCacheOutput` starts a child JVM process, which Wasm cannot do.
+17. **Archived heap objects on 32-bit.** Upstream compiles them out on all 32-bit
+    platforms (`INCLUDE_CDS_JAVA_HEAP` requires `_LP64`), and AOT class linking
+    needs them (via the full module graph): "AOT class linking was enabled in
+    training run but has been disabled due to incompatible module options".
+    Enabling them on Emscripten compiled without errors, but needed these
+    runtime fixes, all in the streamed format (JEP 516), which is the default
+    without compressed oops:
+    - the heap loading mode was only initialized inside `#if INCLUDE_CLASS_SPACE`
+      (64-bit only); symptom: divide-by-zero trap in `AOTMappedHeapLoader::get_root`;
+    - the writer stores a narrowKlass (offset from the archive base) even where
+      headers hold a full `Klass*`; the loader decodes it with `SharedBaseAddress`;
+      symptom: out-of-bounds access in `ObjAllocator::initialize`;
+    - references are stored pointer-sized (`ssize_t`) but were read as `int64_t`;
+    - the copy paths copied the klass word (the narrowKlass) over the correct
+      `Klass*`; symptom: "guarantee(... is_oop(loader())) failed: Loader must be
+      oop" in `SystemDictionary::register_loader`.
+    The writer side needed no changes.
 
 ## Debugging technique that worked
 
@@ -157,9 +183,14 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 | exploded build (mainline) | about 7.5 s (`Create VM` about 5.7 s on jdk25u) |
 | jimage, no CDS | 1.68 s |
 | jimage + CDS | 1.40 s |
-| jimage + CDS, `-Xmx64m` | 1.09 s (`Create VM` 0.19 s) |
+| jimage + CDS, `-Xmx64m` (before archived heap objects) | 1.09 s (`Create VM` 0.19 s) |
+| jimage only, `-Xmx64m` | 1.43 s (`Create VM` 0.30 s) |
+| jimage + CDS with heap objects, `-Xmx64m` | 1.12 s (`Create VM` 0.17 s) |
+| jimage + AOT cache, `-Xmx64m` | 1.05 s (`Create VM` 0.16 s; module system init 3 ms vs 59 ms without archive) |
 | native HotSpot `-Xint -Xshare:off` (for comparison) | about 0.12 s |
 
+- Most of the remaining time (about 0.9 s) is outside VM creation: Node and
+  worker startup, Wasm instantiation, and the application itself.
 - `-Xmx` matters because the whole maximum heap is reserved, and Emscripten's
   mmap zeroes the full reservation (`Genesis` 0.35 s with the default 512 MB,
   0.07 s with 64 MB).
@@ -172,8 +203,8 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 
 ## Next steps
 
-1. Try the AOT cache workflow (`-XX:AOTCacheOutput`) for linked classes and
-   resolved invokedynamic sites on top of CDS.
+1. Measure where the remaining ~0.9 s outside `Create VM` goes (Node/worker
+   startup, instantiating the 3.8 MB module, `PTHREAD_POOL_SIZE=24` workers).
 2. Avoid zeroing large reservations (reserve lazily, or zero on commit only) and
    try a fixed-size Wasm heap (no `ALLOW_MEMORY_GROWTH`).
 3. Replace `MAIN_MODULE` with a generated table of JNI symbols.

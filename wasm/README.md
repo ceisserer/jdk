@@ -6,7 +6,8 @@ pthreads (Web Workers), Serial GC, statically linked JDK.
 
 Status: `java -version` and a Hello World (lambdas/indy, streams, long/double,
 Java threads + `synchronized`, exceptions, GC) run under Node, from a jlinked
-`lib/modules` image with a CDS archive (Hello in about 1.1 s with `-Xmx64m`).
+`lib/modules` image with an AOT cache or CDS archive (Hello in about 1.05 s
+with `-Xmx64m`).
 See `../AGENTS.md` for details, pitfalls and next steps.
 
 ## Prerequisites
@@ -26,10 +27,11 @@ wasm/link.sh                # -> build/linux-wasm32-zero-release/wasm/java.{js,w
 wasm/image.sh               # -> build/linux-wasm32-zero-release/wasm-image (lib/modules)
 wasm/run.sh -version
 
-# Hello World with a CDS archive (CDS needs a JAR, not a class directory)
+# Hello World with an AOT cache (needs a JAR, not a class directory)
 javac -d /tmp/hello wasm/test/Hello.java && jar cf /tmp/hello.jar -C /tmp/hello .
-wasm/cds.sh /tmp/hello.jsa -cp /tmp/hello.jar Hello
-wasm/run.sh -Xmx64m -XX:SharedArchiveFile=/tmp/hello.jsa -cp /tmp/hello.jar Hello
+wasm/aot.sh /tmp/hello.aot -cp /tmp/hello.jar Hello
+wasm/run.sh -Xmx64m -XX:AOTCache=/tmp/hello.aot -cp /tmp/hello.jar Hello
+# or a classic CDS archive: wasm/cds.sh /tmp/hello.jsa ..., -XX:SharedArchiveFile=/tmp/hello.jsa
 ```
 All paths can be overridden, see `env.sh`.
 
@@ -39,6 +41,7 @@ All paths can be overridden, see `env.sh`.
 | `env.sh` | shared settings (paths, emsdk environment) |
 | `build-libffi.sh`, `configure.sh`, `build.sh`, `link.sh`, `run.sh` | build pipeline |
 | `image.sh` | jmod + jlink: `java.base` runtime image with `lib/modules` |
+| `aot.sh` | training run + AOT cache creation (two-step record/create) |
 | `cds.sh` | training run + `-Xshare:dump` for an application's CDS archive |
 | `compat/include/` | headers Emscripten lacks (`sys/eventfd.h`, `sys/sendfile.h`, `sys/inotify.h`, `linux/fs.h`) |
 | `compat/wasm_compat.c` | stub/fallback implementations linked into the launcher |

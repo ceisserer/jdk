@@ -1909,7 +1909,11 @@ MapArchiveResult AOTMetaspace::map_archives(FileMapInfo* static_mapinfo, FileMap
     if (CompressedKlassPointers::base() == klass_range_start) {
       CompressedKlassPointers::establish_protection_zone(klass_range_start, prot_zone_size);
     }
+#endif // INCLUDE_CLASS_SPACE
 
+#if INCLUDE_CLASS_SPACE || defined(__EMSCRIPTEN__)
+    // wasm32 has no class space but does archive heap objects, so the heap
+    // loading mode must be set up there too.
     if (static_mapinfo->can_use_heap_region()) {
       if (static_mapinfo->object_streaming_mode()) {
         AOTHeap::initialize_loading_mode(HeapArchiveMode::_streaming);
@@ -1928,7 +1932,7 @@ MapArchiveResult AOTMetaspace::map_archives(FileMapInfo* static_mapinfo, FileMap
         CDSConfig::stop_using_full_module_graph("No CDS heap data");
       }
     }
-#endif // INCLUDE_CLASS_SPACE
+#endif // INCLUDE_CLASS_SPACE || __EMSCRIPTEN__
     log_info(aot)("initial full module graph: %s", CDSConfig::is_using_full_module_graph() ? "enabled" : "disabled");
   } else {
     unmap_archive(static_mapinfo);

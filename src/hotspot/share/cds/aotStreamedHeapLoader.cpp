@@ -27,6 +27,7 @@
 #include "cds/aotModules.hpp"
 #include "cds/aotStreamedHeapLoader.hpp"
 #include "cds/aotThread.hpp"
+#include "cds/archiveBuilder.hpp"
 #include "cds/cdsConfig.hpp"
 #include "cds/filemap.hpp"
 #include "classfile/javaClasses.inline.hpp"
@@ -146,10 +147,23 @@ void AOTStreamedHeapLoader::set_heap_object_for_object_index(int object_index, o
   }
 }
 
+// The writer always stores a narrowKlass (relative to the archive's mapping
+// start, see ArchiveBuilder::get_requested_narrow_klass). On 64-bit the runtime
+// klass encoding is set up to match, so oopDesc::klass() decodes it. 32-bit
+// (wasm32) has no compressed class pointers: decode it here.
+static Klass* archive_klass(oopDesc* archive_object) {
+#ifdef _LP64
+  return archive_object->klass();
+#else
+  narrowKlass nk = *(narrowKlass*)((address)archive_object + oopDesc::klass_offset_in_bytes());
+  return (Klass*)(SharedBaseAddress + ((uintptr_t)nk << ArchiveBuilder::precomputed_narrow_klass_shift()));
+#endif
+}
+
 int AOTStreamedHeapLoader::archived_string_value_object_index(oopDesc* archive_object) {
-    assert(archive_object->klass() == vmClasses::String_klass(), "Must be an archived string");
+    assert(archive_klass(archive_object) == vmClasses::String_klass(), "Must be an archived string");
     address archive_string_value_addr = (address)archive_object + java_lang_String::value_offset();
-    return UseCompressedOops ? *(int*)archive_string_value_addr : (int)*(int64_t*)archive_string_value_addr;
+    return UseCompressedOops ? *(int*)archive_string_value_addr : (int)*(intptr_t*)archive_string_value_addr;
 }
 
 static int archive_array_length(oopDesc* archive_array) {
@@ -157,7 +171,7 @@ static int archive_array_length(oopDesc* archive_array) {
 }
 
 static size_t archive_object_size(oopDesc* archive_object) {
-  Klass* klass = archive_object->klass();
+  Klass* klass = archive_klass(archive_object);
   int lh = klass->layout_helper();
 
   if (Klass::layout_helper_is_instance(lh)) {
@@ -187,7 +201,7 @@ oop AOTStreamedHeapLoader::allocate_object(oopDesc* archive_object, markWord mar
   NoJvmtiEventsMark njem;
   oop heap_object;
 
-  Klass* klass = archive_object->klass();
+  Klass* klass = archive_klass(archive_object);
   if (klass->is_mirror_instance_klass()) {
     heap_object = Universe::heap()->class_allocate(klass, size, CHECK_NULL);
   } else if (klass->is_instance_klass()) {
@@ -255,7 +269,7 @@ void AOTStreamedHeapLoader::copy_payload_carefully(oopDesc* archive_object,
                                                    BitMap::idx_t start_bit,
                                                    BitMap::idx_t end_bit,
                                                    LinkerT linker) {
-  using RawElementT = std::conditional_t<use_coops, int32_t, int64_t>;
+  using RawElementT = std::conditional_t<use_coops, int32_t, intptr_t>; // writer stores ssize_t
   using OopElementT = std::conditional_t<use_coops, narrowOop, oop>;
 
   BitMap::idx_t unfinished_bit = start_bit;
@@ -316,9 +330,12 @@ void AOTStreamedHeapLoader::copy_object_impl(oopDesc* archive_object,
   if (!_allow_gc) {
     // Without concurrent GC running, we can copy incorrect object references
     // and metadata references into the heap object and then fix them up in-place.
-    size_t payload_size = size - 1;
-    HeapWord* archive_start = ((HeapWord*)archive_object) + 1;
-    HeapWord* heap_start = cast_from_oop<HeapWord*>(heap_object) + 1;
+    // Skip the markWord; on 32-bit also the klass word, which holds the
+    // archived narrowKlass (the correct Klass* is set at allocation time).
+    const size_t skip_words = LP64_ONLY(1) NOT_LP64(2);
+    size_t payload_size = size - skip_words;
+    HeapWord* archive_start = ((HeapWord*)archive_object) + skip_words;
+    HeapWord* heap_start = cast_from_oop<HeapWord*>(heap_object) + skip_words;
 
     Copy::disjoint_words(archive_start, heap_start, payload_size);
 
@@ -337,10 +354,15 @@ void AOTStreamedHeapLoader::copy_object_impl(oopDesc* archive_object,
   // narrowOops or Metadata* into the heap objects. Transitions go from 0 to the
   // intended runtime linked values only.
   size_t word_scale = use_coops ? 2 : 1;
-  using RawElementT = std::conditional_t<use_coops, int32_t, int64_t>;
+  using RawElementT = std::conditional_t<use_coops, int32_t, intptr_t>; // writer stores ssize_t
 
   // Skip the markWord; it is set at allocation time
   size_t header_size = word_scale;
+#ifndef _LP64
+  // On 32-bit the klass word follows and holds the archived narrowKlass, not a
+  // Klass*; the correct klass is also set at allocation time.
+  header_size += 1;
+#endif
 
   size_t buffer_offset = buffer_offset_for_archive_object(archive_object);
   const BitMap::idx_t header_bit = obj_bit_idx_for_buffer_offset<use_coops>(buffer_offset);
@@ -1118,7 +1140,7 @@ AOTMapLogger::OopDataIterator* AOTStreamedHeapLoader::oop_iterator(FileMapInfo* 
 
       intptr_t target_location = (intptr_t)buffered_offset;
       uint32_t narrow_location = checked_cast<uint32_t>(dfs_index);
-      Klass* klass = raw_oop->klass();
+      Klass* klass = archive_klass(raw_oop);
 
       address requested_addr = (address)buffered_offset;
 
