@@ -91,7 +91,7 @@ inline void AOTMustMatchFlags::do_print(outputStream* st, bool v) {
   st->print("%s", v ? "true" : "false");
 }
 
-#ifdef _LP64
+#if defined(_LP64) || defined(__EMSCRIPTEN__) // intx is distinct from int (wasm32: intptr_t is long)
 inline void AOTMustMatchFlags::do_print(outputStream* st, uint v) {
   st->print("%u", v);
 }

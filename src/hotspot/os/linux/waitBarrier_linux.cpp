@@ -22,6 +22,7 @@
  *
  */
 
+#ifndef __EMSCRIPTEN__ // no futex syscall; GenericWaitBarrier is used instead
 #include "runtime/orderAccess.hpp"
 #include "runtime/os.hpp"
 #include "utilities/debug.hpp"
@@ -77,3 +78,4 @@ void LinuxWaitBarrier::wait(int barrier_tag) {
     // Error EAGAIN: we are already disarmed and so will pass the check.
   } while (barrier_tag == _futex_barrier);
 }
+#endif // !__EMSCRIPTEN__

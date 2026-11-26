@@ -31,7 +31,7 @@
 #include "utilities/globalDefinitions.hpp"
 #include "utilities/waitBarrier_generic.hpp"
 
-#if defined(LINUX)
+#if defined(LINUX) && !defined(__EMSCRIPTEN__)
 #include "waitBarrier_linux.hpp"
 typedef LinuxWaitBarrier WaitBarrierDefault;
 #else

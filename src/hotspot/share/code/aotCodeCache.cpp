@@ -889,7 +889,7 @@ inline void log_config_mismatch(uint saved, uint current, const char* name) {
   load_failure_log().print_cr(AOTCODECACHE_DISABLED_MSG "%u vs current %u", name, saved, current);
 }
 
-#ifdef _LP64
+#if defined(_LP64) || defined(__EMSCRIPTEN__) // intx is distinct from int (wasm32: intptr_t is long)
 inline void log_config_mismatch(intx saved, intx current, const char* name) {
   load_failure_log().print_cr(AOTCODECACHE_DISABLED_MSG "%zd vs current %zd", name, saved, current);
 }

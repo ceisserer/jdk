@@ -1128,6 +1128,18 @@ void os::jvm_path(char *buf, jint buflen) {
     return;
   }
 
+#ifdef __EMSCRIPTEN__
+  // Wasm: there is no libjvm file to locate; derive it from JAVA_HOME
+  // (defaults to /jdk in the virtual file system).
+  {
+    const char* jh = ::getenv("JAVA_HOME");
+    if (jh == nullptr || jh[0] == '\0') jh = "/jdk";
+    jio_snprintf(buf, buflen, "%s/lib/zero/libjvm.so", jh);
+    strncpy(saved_jvm_path, buf, MAXPATHLEN);
+    saved_jvm_path[MAXPATHLEN - 1] = '\0';
+    return;
+  }
+#endif
   const char* fname;
 #ifdef AIX
   Dl_info dlinfo;

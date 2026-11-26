@@ -131,8 +131,10 @@ private:
 #undef DECLARE_AOT_MUST_MATCH_FLAG
 
   inline static void do_print(outputStream* st, bool v);
-  LP64_ONLY(inline static void do_print(outputStream* st, uint v);)
-  LP64_ONLY(inline static void do_print(outputStream* st, int v);)
+#if defined(_LP64) || defined(__EMSCRIPTEN__) // intx is distinct from int (wasm32: intptr_t is long)
+  inline static void do_print(outputStream* st, uint v);
+  inline static void do_print(outputStream* st, int v);
+#endif
   inline static void do_print(outputStream* st, intx v);
   inline static void do_print(outputStream* st, uintx v);
   inline static void do_print(outputStream* st, double v);

@@ -128,7 +128,12 @@
 
 // Both Linux and AIX C libraries declare functions noexcept.
 // Neither BSD nor Windows C libraries declare functions noexcept.
+// Neither does Emscripten's musl-based C library (wasm32).
+#ifdef __EMSCRIPTEN__
+#define FORBIDDEN_FUNCTION_COND_NOEXCEPT_noexcept
+#else
 #define FORBIDDEN_FUNCTION_COND_NOEXCEPT_noexcept NOT_WINDOWS(NOT_BSD(noexcept))
+#endif
 #define FORBIDDEN_FUNCTION_COND_NOEXCEPT_
 
 #ifndef FORBIDDEN_FUNCTION_IMPORT_SPEC

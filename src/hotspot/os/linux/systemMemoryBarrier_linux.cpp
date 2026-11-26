@@ -27,6 +27,11 @@
 #include "utilities/debug.hpp"
 #include "utilities/systemMemoryBarrier.hpp"
 
+#ifdef __EMSCRIPTEN__
+// No membarrier syscall in Wasm: report unsupported so HotSpot falls back.
+bool LinuxSystemMemoryBarrier::initialize() { return false; }
+void LinuxSystemMemoryBarrier::emit() { ShouldNotReachHere(); }
+#else
 #include <sys/syscall.h>
 
 // Syscall defined in kernel 4.3
@@ -94,3 +99,4 @@ void LinuxSystemMemoryBarrier::emit() {
   long s = membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0);
   guarantee_with_errno(s >= 0, "MEMBARRIER_CMD_PRIVATE_EXPEDITED failed");
 }
+#endif // __EMSCRIPTEN__

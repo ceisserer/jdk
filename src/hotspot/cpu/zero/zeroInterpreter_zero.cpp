@@ -405,6 +405,19 @@ int ZeroInterpreter::native_entry(Method* method, intptr_t UNUSED, TRAPS) {
       }
       else if (type->size == 8) {
         src--;
+#ifdef __EMSCRIPTEN__
+        // libffi's wasm32 backend loads 8-byte arguments as HEAPU64[addr >>> 3],
+        // which silently rounds unaligned addresses down. Zero's 32-bit stack slots
+        // are only 4-byte aligned, so copy the value to 8-byte aligned scratch space.
+        if (!is_aligned(src, 8)) {
+          void* scratch = stack->alloc(2 * sizeof(jlong));
+          jlong* aligned = (jlong*) align_up((intptr_t) scratch, 8);
+          memcpy(aligned, src, sizeof(jlong));
+          *(dst++) = aligned;
+          src--;
+          continue;
+        }
+#endif
         *(dst++) = src--;
       }
       else {
@@ -420,7 +433,7 @@ int ZeroInterpreter::native_entry(Method* method, intptr_t UNUSED, TRAPS) {
   ThreadStateTransition::transition_from_java(thread, _thread_in_native);
 
   // Make the call
-  intptr_t result[4 - LogBytesPerWord];
+  alignas(8) intptr_t result[4 - LogBytesPerWord]; // 8-aligned: libffi/wasm stores i64/f64 results via HEAPU64
   ffi_call(handler->cif(), (void (*)()) function, result, arguments);
 
   // Change the thread state back to _thread_in_Java and ensure it

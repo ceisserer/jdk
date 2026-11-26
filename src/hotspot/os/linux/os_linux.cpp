@@ -91,7 +91,9 @@
 # include <fenv.h>
 # include <inttypes.h>
 # include <link.h>
+#ifndef __EMSCRIPTEN__
 # include <linux/elf-em.h>
+#endif
 # include <poll.h>
 # include <pthread.h>
 # include <pwd.h>
@@ -102,10 +104,23 @@
 # include <sys/ioctl.h>
 # include <sys/ipc.h>
 # include <sys/mman.h>
+#ifdef __EMSCRIPTEN__
+# define EMSCRIPTEN_ONLY(x) x
+# define NOT_EMSCRIPTEN(x)
+# define NOT_EMSCRIPTEN_TIMERSLACK && false
+# define PR_GET_TIMERSLACK 0
+static inline int prctl(int, ...) { errno = ENOSYS; return -1; }
+#else
+# define EMSCRIPTEN_ONLY(x)
+# define NOT_EMSCRIPTEN(x) x
+# define NOT_EMSCRIPTEN_TIMERSLACK
+#endif
+#ifndef __EMSCRIPTEN__
 # include <sys/prctl.h>
+# include <sys/sendfile.h>
+#endif
 # include <sys/resource.h>
 # include <sys/select.h>
-# include <sys/sendfile.h>
 # include <sys/socket.h>
 # include <sys/stat.h>
 # include <sys/sysinfo.h>
@@ -535,7 +550,7 @@ bool os::Linux::get_tick_information(CPUPerfTicks* pticks, int which_logical_cpu
   return true;
 }
 
-#ifndef SYS_gettid
+#if !defined(SYS_gettid) && !defined(__EMSCRIPTEN__)
 // i386: 224, amd64: 186
   #if defined(__i386__)
     #define SYS_gettid 224
@@ -551,9 +566,13 @@ bool os::Linux::get_tick_information(CPUPerfTicks* pticks, int which_logical_cpu
 // Returns the kernel thread id of the currently running thread. Kernel
 // thread id is used to access /proc.
 pid_t os::Linux::gettid() {
+#ifdef __EMSCRIPTEN__
+  return ::gettid();
+#else
   long rslt = syscall(SYS_gettid);
   assert(rslt != -1, "must be."); // old linuxthreads implementation?
   return (pid_t)rslt;
+#endif
 }
 
 // Returns the amount of swap currently configured, in bytes.
@@ -1144,7 +1163,7 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
 
       // Print current timer slack if override is enabled and timer slack value is available.
       // Avoid calling prctl otherwise for extra safety.
-      if (TimerSlack >= 0) {
+      if (TimerSlack >= 0 NOT_EMSCRIPTEN_TIMERSLACK) {
         int slack = prctl(PR_GET_TIMERSLACK);
         if (slack >= 0) {
           log_info(os, thread)("Thread \"%s\" (pthread id: %zu) timer slack: %dns",
@@ -1757,6 +1776,10 @@ void * os::dll_load(const char *filename, char *ebuf, int ebuflen) {
     return nullptr;
   }
 
+#ifdef __EMSCRIPTEN__
+  // Wasm side modules are not ELF; no architecture diagnostics.
+  return nullptr;
+#else
   Elf32_Ehdr elf_head;
   size_t prefix_len = strlen(ebuf);
   ssize_t diag_msg_max_length = ebuflen - prefix_len;
@@ -1945,6 +1968,7 @@ void * os::dll_load(const char *filename, char *ebuf, int ebuflen) {
   }
 
   return nullptr;
+#endif // __EMSCRIPTEN__
 }
 
 void * os::Linux::dlopen_helper(const char *filename, char *ebuf, int ebuflen) {
@@ -3025,6 +3049,11 @@ static void warn_fail_commit_memory(char* addr, size_t size,
 //       left at the time of mmap(). This could be a potential
 //       problem.
 int os::Linux::commit_memory_impl(char* addr, size_t size, bool exec) {
+#ifdef __EMSCRIPTEN__
+  // Wasm linear memory has no reserve/commit distinction: reserved memory
+  // is already accessible (and zeroed by reserve/uncommit), so commit is a no-op.
+  return 0;
+#endif
   int prot = exec ? PROT_READ|PROT_WRITE|PROT_EXEC : PROT_READ|PROT_WRITE;
   uintptr_t res = (uintptr_t) ::mmap(addr, size, prot,
                                      MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0);
@@ -3284,7 +3313,15 @@ int os::Linux::sched_getcpu_syscall(void) {
   return (retval == -1) ? -1 : cpu;
 }
 
+#ifdef __EMSCRIPTEN__
+static int wasm_sched_getcpu() { return 0; } // no CPU identity in Wasm
+#endif
+
 void os::Linux::sched_getcpu_init() {
+#ifdef __EMSCRIPTEN__
+  set_sched_getcpu(&wasm_sched_getcpu);
+  return;
+#endif
   // sched_getcpu() should be in libc.
   set_sched_getcpu(CAST_TO_FN_PTR(sched_getcpu_func_t,
                                   dlsym(RTLD_DEFAULT, "sched_getcpu")));
@@ -3307,7 +3344,7 @@ extern "C" JNIEXPORT void numa_error(char *where) { }
 // Handle request to load libnuma symbol version 1.1 (API v1). If it fails
 // load symbol from base version instead.
 void* os::Linux::libnuma_dlsym(void* handle, const char *name) {
-  void *f = dlvsym(handle, name, "libnuma_1.1");
+  void *f = EMSCRIPTEN_ONLY(nullptr) NOT_EMSCRIPTEN(dlvsym(handle, name, "libnuma_1.1"));
   if (f == nullptr) {
     f = dlsym(handle, name);
   }
@@ -3317,7 +3354,7 @@ void* os::Linux::libnuma_dlsym(void* handle, const char *name) {
 // Handle request to load libnuma symbol version 1.2 (API v2) only.
 // Return null if the symbol is not defined in this particular version.
 void* os::Linux::libnuma_v2_dlsym(void* handle, const char* name) {
-  return dlvsym(handle, name, "libnuma_1.2");
+  return EMSCRIPTEN_ONLY(nullptr) NOT_EMSCRIPTEN(dlvsym(handle, name, "libnuma_1.2"));
 }
 
 // Check numa dependent syscalls
@@ -3670,6 +3707,10 @@ struct bitmask* os::Linux::_numa_membind_bitmask;
 struct bitmask* os::Linux::_numa_cpunodebind_bitmask;
 
 bool os::pd_uncommit_memory(char* addr, size_t size, bool exec) {
+#ifdef __EMSCRIPTEN__
+  ::memset(addr, 0, size); // cannot return pages to the host; zero to mimic a fresh commit
+  return true;
+#endif
   uintptr_t res = (uintptr_t) ::mmap(addr, size, PROT_NONE,
                                      MAP_PRIVATE|MAP_FIXED|MAP_NORESERVE|MAP_ANONYMOUS, -1, 0);
   if (res == (uintptr_t) MAP_FAILED) {
@@ -3758,6 +3799,11 @@ static address get_stack_commited_bottom(address bottom, size_t size) {
 // mapping. This only affects the main/primordial thread
 
 bool os::pd_create_stack_guard_pages(char* addr, size_t size) {
+#ifdef __EMSCRIPTEN__
+  // No memory protection in Wasm; guard zones are bookkeeping only. Never touch
+  // the memory: the bottom of the stack holds Emscripten's stack cookie.
+  return true;
+#endif
   if (os::is_primordial_thread()) {
     // As we manually grow stack up to bottom inside create_attached_thread(),
     // it's likely that os::Linux::initial_thread_stack_bottom is mapped and
@@ -3791,6 +3837,9 @@ bool os::pd_create_stack_guard_pages(char* addr, size_t size) {
 // always place it right after end of the mapped region.
 
 void os::remove_stack_guard_pages(char* addr, size_t size) {
+#ifdef __EMSCRIPTEN__
+  return; // see pd_create_stack_guard_pages
+#endif
 
   if (os::is_primordial_thread()) {
     if (::munmap(addr, size) != 0) {
@@ -3806,6 +3855,15 @@ void os::remove_stack_guard_pages(char* addr, size_t size) {
 // may not start from the requested address. Unlike Linux mmap(), this
 // function returns null to indicate failure.
 static char* anon_mmap(char* requested_addr, size_t bytes) {
+#ifdef __EMSCRIPTEN__
+  // Emscripten's mmap cannot place mappings; it allocates zeroed,
+  // 64K-aligned memory from the malloc heap.
+  if (requested_addr != nullptr) {
+    return nullptr;
+  }
+  char* wasm_addr = (char*)::mmap(nullptr, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  return wasm_addr == MAP_FAILED ? nullptr : wasm_addr;
+#else
   // If a requested address was given:
   //
   // The POSIX-conforming way is to *omit* MAP_FIXED. This will leave existing mappings intact.
@@ -3836,6 +3894,7 @@ static char* anon_mmap(char* requested_addr, size_t bytes) {
     return nullptr;
   }
   return addr;
+#endif // __EMSCRIPTEN__
 }
 
 // Allocate (using mmap, NO_RESERVE, with small pages) at either a given request address
@@ -3846,6 +3905,8 @@ static char* anon_mmap(char* requested_addr, size_t bytes) {
 //     It must be a multiple of allocation granularity.
 // Returns address of memory or null. If req_addr was not null, will only return
 //  req_addr or null.
+static int anon_munmap(char * addr, size_t size);
+
 static char* anon_mmap_aligned(char* req_addr, size_t bytes, size_t alignment) {
   size_t extra_size = bytes;
   if (req_addr == nullptr && alignment > 0) {
@@ -3870,7 +3931,7 @@ static char* anon_mmap_aligned(char* req_addr, size_t bytes, size_t alignment) {
       char* const end = start + extra_size;
       if (start_aligned > start) {
         const size_t l = start_aligned - start;
-        if (::munmap(start, l) != 0) {
+        if (EMSCRIPTEN_ONLY(!anon_munmap(start, l)) NOT_EMSCRIPTEN(::munmap(start, l) != 0)) {
           ErrnoPreserver ep;
           log_trace(os, map)("munmap failed: " RANGEFMT " errno=(%s)",
                              RANGEFMTARGS(start, l),
@@ -3879,7 +3940,7 @@ static char* anon_mmap_aligned(char* req_addr, size_t bytes, size_t alignment) {
       }
       if (end_aligned < end) {
         const size_t l = end - end_aligned;
-        if (::munmap(end_aligned, l) != 0) {
+        if (EMSCRIPTEN_ONLY(!anon_munmap(end_aligned, l)) NOT_EMSCRIPTEN(::munmap(end_aligned, l) != 0)) {
           ErrnoPreserver ep;
           log_trace(os, map)("munmap failed: " RANGEFMT " errno=(%s)",
                              RANGEFMTARGS(end_aligned, l),
@@ -3893,6 +3954,14 @@ static char* anon_mmap_aligned(char* req_addr, size_t bytes, size_t alignment) {
 }
 
 static int anon_munmap(char * addr, size_t size) {
+#ifdef __EMSCRIPTEN__
+  // Emscripten only unmaps whole mappings. For a partial release, zero
+  // the range and leak it (it stays part of the malloc'ed block).
+  if (::munmap(addr, size) != 0) {
+    ::memset(addr, 0, size);
+  }
+  return 1;
+#endif
   if (::munmap(addr, size) != 0) {
     ErrnoPreserver ep;
     log_trace(os, map)("munmap failed: " RANGEFMT " errno=(%s)",
@@ -4522,7 +4591,12 @@ jlong os::Linux::thread_cpu_time(clockid_t clockid) {
 // the number of bytes written to out_fd is returned if transfer was successful
 // otherwise, returns -1 that implies an error
 jlong os::Linux::sendfile(int out_fd, int in_fd, jlong* offset, jlong count) {
+#ifdef __EMSCRIPTEN__
+  errno = ENOSYS;
+  return -1;
+#else
   return ::sendfile(out_fd, in_fd, (off_t*)offset, (size_t)count);
+#endif
 }
 
 // Determine if the vmid is the parent pid for a child in a PID namespace.
@@ -4814,11 +4888,13 @@ jint os::init_2(void) {
   // Override the timer slack value if needed. The adjustment for the main
   // thread will establish the setting for child threads, which would be
   // most threads in JDK/JVM.
+#ifndef __EMSCRIPTEN__
   if (TimerSlack >= 0) {
     if (prctl(PR_SET_TIMERSLACK, TimerSlack) < 0) {
       vm_exit_during_initialization("Setting timer slack failed: %s", os::strerror(errno));
     }
   }
+#endif // !__EMSCRIPTEN__
 
   return JNI_OK;
 }
@@ -5029,8 +5105,13 @@ void os::set_native_thread_name(const char *name) {
   // since this is the only way to make ASAN aware of our thread names. Even
   // though ASAN intercepts both prctl and pthread_setname_np, it only processes
   // the thread name given to the former.
+#ifdef __EMSCRIPTEN__
+  // No kernel thread names in Wasm (Web Workers are named by the embedder).
+  return;
+#else
   int rc = prctl(PR_SET_NAME, buf);
   assert(rc == 0, "prctl(PR_SET_NAME) failed");
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////
