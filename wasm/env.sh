@@ -6,11 +6,15 @@ JDK_SRC=${JDK_SRC:-$(cd "$WASM_DIR/.." && pwd)}       # OpenJDK source tree to b
 EMSDK=${EMSDK:-$HOME/emsdk}                             # emsdk checkout (./emsdk install latest)
 WASM_SYSROOT=${WASM_SYSROOT:-$HOME/wasm-sysroot}        # libffi (+ empty libatomic/librt) for wasm32
 BOOT_JDK=${BOOT_JDK:-}                                  # JDK N-1 (or N) for the host
-BUILD_JDK=${BUILD_JDK:-}                                # host JDK of the SAME version as the tree; empty = configure builds one
+BUILD_JDK=${BUILD_JDK:-}                                # leave empty: the build then creates one from this tree, which wasm/image.sh needs
 CONF_NAME=${CONF_NAME:-linux-wasm32-zero-release}
 BUILD_DIR=$JDK_SRC/build/$CONF_NAME
 OUT_DIR=${OUT_DIR:-$BUILD_DIR/wasm}                     # linked java.js / java.wasm
-JAVA_HOME_WASM=${JAVA_HOME_WASM:-$BUILD_DIR/jdk}        # exploded image used as JAVA_HOME at runtime
+# Runtime JAVA_HOME: the jlinked image from wasm/image.sh if present, else the
+# exploded build (much slower startup: every class is a separate file read).
+if [ -z "$JAVA_HOME_WASM" ]; then
+  if [ -f "$BUILD_DIR/wasm-image/lib/modules" ]; then JAVA_HOME_WASM=$BUILD_DIR/wasm-image; else JAVA_HOME_WASM=$BUILD_DIR/jdk; fi
+fi
 
 if [ ! -f "$EMSDK/emsdk_env.sh" ]; then
   echo "emsdk not found at $EMSDK (set EMSDK)" >&2

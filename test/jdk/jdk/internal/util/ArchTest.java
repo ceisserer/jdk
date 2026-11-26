@@ -39,6 +39,7 @@ import static jdk.internal.util.Architecture.PPC64LE;
 import static jdk.internal.util.Architecture.RISCV64;
 import static jdk.internal.util.Architecture.S390;
 import static jdk.internal.util.Architecture.SPARCV9;
+import static jdk.internal.util.Architecture.WASM32;
 import static jdk.internal.util.Architecture.X64;
 import static jdk.internal.util.Architecture.X86;
 
@@ -89,6 +90,7 @@ public class ArchTest {
                 Arguments.of("s390", S390, 64, ByteOrder.BIG_ENDIAN, Architecture.isS390()),
                 Arguments.of("s390x", S390, 64, ByteOrder.BIG_ENDIAN, Architecture.isS390()),
                 Arguments.of("sparcv9", SPARCV9, 64, ByteOrder.BIG_ENDIAN, Architecture.isSPARCV9()),
+                Arguments.of("wasm32", WASM32, 32, ByteOrder.LITTLE_ENDIAN, Architecture.isWASM32()),
                 Arguments.of("x64", X64, 64, ByteOrder.LITTLE_ENDIAN, Architecture.isX64()),
                 Arguments.of("x86", X86, 32, ByteOrder.LITTLE_ENDIAN, Architecture.isX86()),
                 Arguments.of("x86_64", X64, 64, ByteOrder.LITTLE_ENDIAN, Architecture.isX64())

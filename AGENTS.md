@@ -38,26 +38,37 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
     `intx` overloads (see the pitfalls below).
   - `waitBarrier.hpp`, `waitBarrier_linux.cpp`, `systemMemoryBarrier_linux.cpp`:
     no futex or membarrier syscalls.
+  - `src/hotspot/share/cds/aotMetaspace.hpp`: read CDS regions instead of mmap.
+  - `src/java.base/unix/native/libnio/fs/UnixNativeDispatcher.c`: bind
+    `openat`/`fstatat`/`fdopendir` directly.
+  - `src/java.base/share/classes/jdk/internal/util/Architecture.java` and
+    `PlatformProps.java.template`: `WASM32` architecture (plus
+    `test/jdk/jdk/internal/util/ArchTest.java`).
 
 ## Building and testing
 
-- Mainline needs a **JDK 27 boot JDK**. A cross build also needs a build JDK of
-  the tree's own version (`BUILD_JDK`); without one, configure builds it itself,
-  which takes much longer. Tested with JDK 27.0.1.1 (GA) as boot JDK and JDK 28
-  EA build 25 as build JDK, both from `download.java.net` (verify the published
-  `.sha256`).
+- Mainline needs a **JDK 27 boot JDK** (tested: 27.0.1.1 GA from
+  `download.java.net`; verify the published `.sha256`).
+- **Do not pass `BUILD_JDK`.** The build then creates its own host build JDK from
+  this tree (`make create-buildjdk`, a few minutes; `wasm/image.sh` runs it if
+  needed). `jlink` only accepts a `java.base` from exactly the same build as
+  itself, so an external JDK 28 (e.g. an EA build) can compile `java.base` but
+  cannot create the image.
 - `JAVA_TOOL_OPTIONS` and `_JAVA_OPTIONS` must be unset, or configure aborts
   (`wasm/env.sh` unsets them).
 - Order: `wasm/build-libffi.sh`, `wasm/configure.sh`, `wasm/build.sh`,
-  `wasm/link.sh`, `wasm/run.sh -version`.
+  `wasm/link.sh`, `wasm/image.sh`, `wasm/run.sh -version`. Optionally
+  `wasm/cds.sh app.jsa -cp app.jar Main` for a CDS archive.
+- `wasm/run.sh` uses the jlinked image (`build/<conf>/wasm-image`) as `JAVA_HOME`
+  when it exists, otherwise the exploded build (`build/<conf>/jdk`).
 - To see every compile error at once instead of stopping at the first:
   `wasm/build.sh MAKE_ARGS=-k`, then read
   `build/<conf>/make-support/failure-logs/*.log`.
 - To rebuild one HotSpot object fast, re-run the command in
   `failure-logs/*.cmdline`.
-- Verification state: the full chain (configure → build → link → `java -version`
-  and `Hello`) runs on this branch (JDK 28 mainline) and was earlier also verified
-  on jdk25u (25.0.6).
+- Verification state: the full chain (configure → build → link → image → CDS
+  dump → `java -version` and `Hello` with the archive) runs on this branch (JDK 28
+  mainline). Without the image and CDS it was earlier also verified on jdk25u.
 - Smoke test: `javac -d /tmp/hello wasm/test/Hello.java && wasm/run.sh -cp /tmp/hello Hello`.
   It should print `thread sum = 10` and end with `gc ok`.
 
@@ -107,6 +118,24 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 12. **HotSpot needs threads from the start** (VM thread, Reference Handler, etc.).
     Hence `-pthread`, `-sPROXY_TO_PTHREAD` and `-sPTHREAD_POOL_SIZE=24`. In a
     browser this also requires COOP/COEP headers.
+13. **jlink needs a known platform.** The jmod's `--target-platform linux-wasm32`
+    is parsed with `jdk.internal.util.Architecture.lookupByName`, which rejects
+    unknown names; `WASM32` is now an enum constant (with `isWASM32()` and
+    `PlatformProps.TARGET_ARCH_IS_WASM32`). `make java.base-jmod` does not work
+    (it needs a shared `libjvm.so` and all other jmods); `wasm/image.sh` packages
+    the jmod directly from the exploded classes.
+14. **CDS archives are read, not mapped.** Emscripten cannot mmap a file into
+    reserved memory, so `AOTMetaspace::use_windows_memory_mapping()` returns true
+    on Emscripten (the Windows path, which `read()`s the regions into the
+    reserved space). The log line "Mapped static region" is printed either way.
+15. **CDS rejects directories on the classpath** ("non-empty directory"); package
+    the application as a JAR. On wasm32 there are no archived heap objects
+    ("initial full module graph: disabled"); the archive holds class metadata only.
+16. **CDS vs AOT cache:** the JDK 24+ "AOT cache" (`-XX:AOTCacheOutput`, Leyden) is
+    CDS extended with linked classes, resolved invokedynamic sites, method profiles
+    and (newer) compiled code. For Zero only the CDS part plus class linking and
+    resolved call sites help; profiles and compiled code need a JIT. "AOT code" in
+    the next steps means a future Wasm code tier, not this cache.
 
 ## Debugging technique that worked
 
@@ -121,12 +150,20 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 - Calling HotSpot's `pss()` from the JS main thread printed nothing, because
   that thread is not attached to the VM.
 
-## Performance baseline (jdk25u, Node 22, 4 cores)
+## Performance (Node 22, 4 cores, `wasm/test/Hello.java`, wall clock incl. Node)
 
-- Hello World takes about 6.5 s on jdk25u and about 7.5 s on mainline; `Create VM`
-  alone takes about 5.7 s on jdk25u. Native
-  `-Xint -Xshare:off` needs about 0.12 s.
-- Main Java thread during startup:
+| Setup | Time |
+|---|---|
+| exploded build (mainline) | about 7.5 s (`Create VM` about 5.7 s on jdk25u) |
+| jimage, no CDS | 1.68 s |
+| jimage + CDS | 1.40 s |
+| jimage + CDS, `-Xmx64m` | 1.09 s (`Create VM` 0.19 s) |
+| native HotSpot `-Xint -Xshare:off` (for comparison) | about 0.12 s |
+
+- `-Xmx` matters because the whole maximum heap is reserved, and Emscripten's
+  mmap zeroes the full reservation (`Genesis` 0.35 s with the default 512 MB,
+  0.07 s with 64 MB).
+- Breakdown of the old exploded-build startup (main Java thread):
   - Zero interpreter: about 1.9 s.
   - Waiting on file I/O proxied to the JS main thread (about 450 class files
     loaded from the exploded image): about 1.5 s.
@@ -135,11 +172,10 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 
 ## Next steps
 
-1. Build `lib/modules` (jimage) and try a CDS archive or AOT cache
-   (`-XX:AOTCacheOutput`) from a training run under Node. That is the biggest
-   startup win.
-2. Use a fixed-size heap (no `ALLOW_MEMORY_GROWTH`) and avoid zeroing large
-   reservations.
+1. Try the AOT cache workflow (`-XX:AOTCacheOutput`) for linked classes and
+   resolved invokedynamic sites on top of CDS.
+2. Avoid zeroing large reservations (reserve lazily, or zero on commit only) and
+   try a fixed-size Wasm heap (no `ALLOW_MEMORY_GROWTH`).
 3. Replace `MAIN_MODULE` with a generated table of JNI symbols.
 4. Browser embedding: COOP/COEP headers, a preloaded virtual file system instead
    of `NODERAWFS`, and running in a worker.

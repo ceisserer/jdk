@@ -195,6 +195,10 @@ public:
   static intx relocation_delta() { return _relocation_delta; }
 
   static bool use_windows_memory_mapping() {
+#ifdef __EMSCRIPTEN__
+    // Wasm cannot mmap a file into reserved memory either; read the regions instead.
+    return true;
+#endif
     const bool is_windows = (NOT_WINDOWS(false) WINDOWS_ONLY(true));
     //const bool is_windows = true; // enable this to allow testing the windows mmap semantics on Linux, etc.
     return is_windows;

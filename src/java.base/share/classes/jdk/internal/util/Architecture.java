@@ -53,6 +53,7 @@ public enum Architecture {
     RISCV64(64, ByteOrder.LITTLE_ENDIAN),
     S390(64, ByteOrder.BIG_ENDIAN),
     SPARCV9(64, ByteOrder.BIG_ENDIAN),
+    WASM32(32, ByteOrder.LITTLE_ENDIAN),
     X86(32, ByteOrder.LITTLE_ENDIAN),
     X64(64, ByteOrder.LITTLE_ENDIAN),  // Represents AMD64 and X86_64
     ;
@@ -186,6 +187,14 @@ public enum Architecture {
     @ForceInline
     public static boolean isARM() {
         return PlatformProps.TARGET_ARCH_IS_ARM;
+    }
+
+    /**
+     * {@return {@code true} if the current architecture is WASM32 (WebAssembly)}
+     */
+    @ForceInline
+    public static boolean isWASM32() {
+        return PlatformProps.TARGET_ARCH_IS_WASM32;
     }
 
     /**
