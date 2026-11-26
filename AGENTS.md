@@ -43,7 +43,9 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 
 - Mainline needs a **JDK 27 boot JDK**. A cross build also needs a build JDK of
   the tree's own version (`BUILD_JDK`); without one, configure builds it itself,
-  which takes much longer.
+  which takes much longer. Tested with JDK 27.0.1.1 (GA) as boot JDK and JDK 28
+  EA build 25 as build JDK, both from `download.java.net` (verify the published
+  `.sha256`).
 - `JAVA_TOOL_OPTIONS` and `_JAVA_OPTIONS` must be unset, or configure aborts
   (`wasm/env.sh` unsets them).
 - Order: `wasm/build-libffi.sh`, `wasm/configure.sh`, `wasm/build.sh`,
@@ -53,11 +55,9 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
   `build/<conf>/make-support/failure-logs/*.log`.
 - To rebuild one HotSpot object fast, re-run the command in
   `failure-logs/*.cmdline`.
-- Verification state:
-  - The full chain (configure → run `Hello`) was tested on jdk25u (25.0.6).
-  - On mainline only `make hotspot-zero-static-libs` was verified, using a JDK 25
-    boot JDK with the version checks relaxed locally. `java.base` was not built,
-    because the interim javac needs JDK 27.
+- Verification state: the full chain (configure → build → link → `java -version`
+  and `Hello`) runs on this branch (JDK 28 mainline) and was earlier also verified
+  on jdk25u (25.0.6).
 - Smoke test: `javac -d /tmp/hello wasm/test/Hello.java && wasm/run.sh -cp /tmp/hello Hello`.
   It should print `thread sum = 10` and end with `gc ok`.
 
@@ -96,7 +96,15 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
    output into `head`; output can look lost when the process hangs.
 9. **"warning: unsupported syscall: __syscall_prlimit64/mprotect/madvise"** messages
    are expected and harmless.
-10. **HotSpot needs threads from the start** (VM thread, Reference Handler, etc.).
+10. **musl has no `*64` aliases** (`fstatat64`, `openat64`). Code that looks them
+    up with `dlsym` silently gets NULL. libnio now binds `openat`/`fstatat`/
+    `fdopendir` directly on Emscripten, as on BSD. Symptom: `InternalError: should
+    not reach here` from `UnixNativeDispatcher.fstatat` while the boot layer
+    initializes. `-Xlog:exceptions=info` shows where such an exception is thrown.
+11. **The stock static-launcher link always fails** (GNU ld flags that `wasm-ld`
+    rejects). `wasm/build.sh` runs it only to get `main.o`; the target is
+    `static-launchers` on mainline and `static-launcher` in JDK 25.
+12. **HotSpot needs threads from the start** (VM thread, Reference Handler, etc.).
     Hence `-pthread`, `-sPROXY_TO_PTHREAD` and `-sPTHREAD_POOL_SIZE=24`. In a
     browser this also requires COOP/COEP headers.
 
@@ -115,7 +123,8 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 
 ## Performance baseline (jdk25u, Node 22, 4 cores)
 
-- Hello World takes about 6.5 s; `Create VM` alone takes about 5.7 s. Native
+- Hello World takes about 6.5 s on jdk25u and about 7.5 s on mainline; `Create VM`
+  alone takes about 5.7 s on jdk25u. Native
   `-Xint -Xshare:off` needs about 0.12 s.
 - Main Java thread during startup:
   - Zero interpreter: about 1.9 s.

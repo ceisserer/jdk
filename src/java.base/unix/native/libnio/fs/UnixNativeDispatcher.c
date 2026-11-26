@@ -344,7 +344,8 @@ Java_sun_nio_fs_UnixNativeDispatcher_init(JNIEnv* env, jclass this)
     my_openat_func = (openat_func*) dlsym(RTLD_DEFAULT, "open64at");
     my_fstatat_func = (fstatat_func*) dlsym(RTLD_DEFAULT, "stat64at");
     my_fdopendir_func = (fdopendir_func*) dlsym(RTLD_DEFAULT, "fdopendir64");
-#elif defined(_ALLBSD_SOURCE)
+#elif defined(_ALLBSD_SOURCE) || defined(__EMSCRIPTEN__)
+    // Emscripten's musl has no *64 aliases (openat64, fstatat64) to dlsym.
     my_openat_func = (openat_func*) openat;
     my_fstatat_func = (fstatat_func*) fstatat;
     my_fdopendir_func = (fdopendir_func*) fdopendir;
