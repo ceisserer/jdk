@@ -49,6 +49,9 @@
 #include "utilities/macros.hpp"
 
 #include "entry_zero.hpp"
+#ifdef __EMSCRIPTEN__
+#include "wasmJit_zero.hpp"
+#endif
 #include "stack_zero.inline.hpp"
 
 void ZeroInterpreter::initialize_stub() {
@@ -103,6 +106,14 @@ InterpreterCodelet* ZeroInterpreter::codelet_containing(address pc) {
 
 int ZeroInterpreter::normal_entry(Method* method, intptr_t UNUSED, TRAPS) {
   JavaThread *thread = THREAD;
+
+#ifdef __EMSCRIPTEN__
+  // Experimental baseline compiler: count interpreted invocations (off
+  // unless WASM_JIT is set).
+  if (!WasmJit::disabled()) {
+    WasmJit::on_interpreted_invocation(method, THREAD);
+  }
+#endif
 
   // Allocate and initialize our frame.
   InterpreterFrame *frame = InterpreterFrame::build(method, CHECK_0);

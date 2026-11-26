@@ -79,6 +79,9 @@ friend class AbstractInterpreterGenerator;
 friend class ZeroInterpreterGenerator;
 friend class InterpreterMacroAssembler;
 friend class frame;
+#ifdef __EMSCRIPTEN__
+friend class WasmJit;       // experimental wasm32 compiler: frame field offsets
+#endif
 
 public:
     enum messages {
