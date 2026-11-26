@@ -16,11 +16,15 @@ if [ -z "$JAVA_HOME_WASM" ]; then
   if [ -f "$BUILD_DIR/wasm-image/lib/modules" ]; then JAVA_HOME_WASM=$BUILD_DIR/wasm-image; else JAVA_HOME_WASM=$BUILD_DIR/jdk; fi
 fi
 
-if [ ! -f "$EMSDK/emsdk_env.sh" ]; then
+# run.sh only needs node; sourcing emsdk_env.sh costs about 150 ms per run.
+if [ "${WASM_RUNTIME_ONLY:-0}" = 1 ] && command -v node >/dev/null; then
+  :
+elif [ ! -f "$EMSDK/emsdk_env.sh" ]; then
   echo "emsdk not found at $EMSDK (set EMSDK)" >&2
   return 1 2>/dev/null || exit 1
+else
+  source "$EMSDK/emsdk_env.sh" >/dev/null 2>&1
 fi
-source "$EMSDK/emsdk_env.sh" >/dev/null 2>&1
 EM_LLVM_BIN=$EMSDK/upstream/bin
 
 # The JDK build refuses to run when these are set (they leak into the boot JDK).

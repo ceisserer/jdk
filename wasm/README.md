@@ -6,8 +6,8 @@ pthreads (Web Workers), Serial GC, statically linked JDK.
 
 Status: `java -version` and a Hello World (lambdas/indy, streams, long/double,
 Java threads + `synchronized`, exceptions, GC) run under Node, from a jlinked
-`lib/modules` image with an AOT cache or CDS archive (Hello in about 1.05 s
-with `-Xmx64m`).
+`lib/modules` image with an AOT cache or CDS archive (Hello in about 0.65 s
+wall clock with `-Xmx64m`).
 See `../AGENTS.md` for details, pitfalls and next steps.
 
 ## Prerequisites
@@ -48,4 +48,5 @@ All paths can be overridden, see `env.sh`.
 | `js/env-pre.js` | passes the Node environment to `getenv()` |
 | `js/killer.js` | ends hung runs (failed VM init does not exit) |
 | `tools/topprof.py` | summarizes `node --cpu-prof` profiles per thread |
+| `js/timing-pre.js`, `tools/timeline.py`, `test/Probe.java` | startup timeline (link with `TIMING=1`) |
 | `test/Hello.java` | smoke test |

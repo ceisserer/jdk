@@ -189,8 +189,36 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 | jimage + AOT cache, `-Xmx64m` | 1.05 s (`Create VM` 0.16 s; module system init 3 ms vs 59 ms without archive) |
 | native HotSpot `-Xint -Xshare:off` (for comparison) | about 0.12 s |
 
-- Most of the remaining time (about 0.9 s) is outside VM creation: Node and
-  worker startup, Wasm instantiation, and the application itself.
+- The numbers above were measured through `wasm/run.sh`, which then still
+  sourced `emsdk_env.sh` (about 150 ms per run) and used a pool of 24 workers.
+- **Thread pool size dominated the rest.** Every pool worker is a separate JS
+  isolate that loads `java.js`/`java.wasm`; on 4 cores, 24 of them delayed
+  startup by about 370 ms (the main thread's `readFileSync` of `java.wasm`
+  "took" 355 ms in the profile) and exit by about 100 ms. A small pool makes
+  extra threads expensive instead (pool 4: Java `main()` 250 ms instead of 65 ms).
+  Hello, AOT cache, `-Xmx64m`, internal timeline, best of 3 to 5:
+
+  | Pool | Total | of which exit after `main()` |
+  |---|---|---|
+  | 24 | 875 ms | 100 ms |
+  | 16 | 694 ms | 83 ms |
+  | 12 | 636 ms | 84 ms |
+  | 12 + `PTHREAD_POOL_DELAY_LOAD` (now default) | 562 to 603 ms | 64 ms |
+  | 8 | 808 ms | |
+  | 4 | 998 ms | |
+
+- Now (pool 12, delayed pool load, `run.sh` without emsdk): Hello with AOT cache
+  and `-Xmx64m` takes **0.65 s** wall clock; `node -e 0` alone takes 0.03 s.
+  Phases (internal timeline, about 560 ms total): Node start and parsing
+  `java.js` 40 ms; reading/instantiating `java.wasm` and starting the pool until
+  C `main()` about 165 to 220 ms; launcher + `Create VM` about 215 to 265 ms
+  (`Create VM` about 170 ms); Java `main()` about 65 ms; exit about 50 to 65 ms.
+- `-XX:-UsePerfData`, `-XX:+ReduceSignalUsage` and
+  `-XX:-AOTCacheParallelRelocation` changed the total only within the noise
+  (about ±30 ms).
+- How to measure: link with `TIMING=1` (`wasm/js/timing-pre.js`), run
+  `wasm/test/Probe.java` with `-Xlog:startuptime:stderr:timemillis`, and pipe the
+  output into `wasm/tools/timeline.py` (see the comment in `Probe.java`).
 - `-Xmx` matters because the whole maximum heap is reserved, and Emscripten's
   mmap zeroes the full reservation (`Genesis` 0.35 s with the default 512 MB,
   0.07 s with 64 MB).
@@ -203,8 +231,9 @@ Everything else in the tree is upstream OpenJDK; follow upstream conventions
 
 ## Next steps
 
-1. Measure where the remaining ~0.9 s outside `Create VM` goes (Node/worker
-   startup, instantiating the 3.8 MB module, `PTHREAD_POOL_SIZE=24` workers).
+1. Reduce the cost per worker (each loads all of `java.js`/`java.wasm`): a smaller
+   module without `MAIN_MODULE` (its GOT/table setup took about 35 ms on the main
+   thread), and fewer HotSpot threads at startup.
 2. Avoid zeroing large reservations (reserve lazily, or zero on commit only) and
    try a fixed-size Wasm heap (no `ALLOW_MEMORY_GROWTH`).
 3. Replace `MAIN_MODULE` with a generated table of JNI symbols.
