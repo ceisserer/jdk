@@ -4,6 +4,7 @@
  */
 #ifdef __EMSCRIPTEN__
 
+#include "classfile/classLoaderData.inline.hpp"
 #include "entry_zero.hpp"
 #include "gc/shared/barrierSet.hpp"
 #include "gc/shared/cardTable.hpp"
@@ -21,10 +22,12 @@
 #include "oops/klassVtable.hpp"
 #include "oops/objArrayKlass.hpp"
 #include "runtime/signature.hpp"
+#include "runtime/task.hpp"
 #include "oops/constantPool.inline.hpp"
 #include "oops/cpCache.inline.hpp"
 #include "oops/method.inline.hpp"
 #include "oops/methodCounters.hpp"
+#include "oops/oopHandle.inline.hpp"
 #include "oops/resolvedFieldEntry.hpp"
 #include "oops/resolvedMethodEntry.hpp"
 #include "prims/jvmtiExport.hpp"
@@ -33,6 +36,8 @@
 #include "runtime/handles.inline.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "runtime/javaThread.hpp"
+#include "runtime/mutex.hpp"
+#include "runtime/mutexLocker.hpp"
 #include "runtime/os.hpp"
 #include "runtime/vmOperations.hpp"
 #include "runtime/vmThread.hpp"
@@ -54,6 +59,21 @@ static const char* wasmjit_dir = "/tmp";
 static volatile int wasmjit_module_counter = 0;
 static int wasmjit_log_level = 0;           // WASM_JIT_LOG: 1 compilations/OSR, 2 also bailouts
 static int wasmjit_max_bailouts = 10000;    // WASM_JIT_MAX_BAILOUTS: then revert to the interpreter
+static int wasmjit_batch_ms = 50;           // WASM_JIT_BATCH_MS: 0 = no batching
+static int wasmjit_batch_max = 256;         // WASM_JIT_BATCH_MAX: methods per module
+// Written by the constructor of a loaded module: the module's first table slot.
+static volatile int wasmjit_table_base = -1;
+
+// A method waiting for compilation. holder keeps its class loader alive
+// (null for the boot loader).
+struct WasmJitRequest {
+  Method* method;
+  oop* holder;
+};
+
+static GrowableArrayCHeap<WasmJitRequest, mtCode>* wasmjit_queue = nullptr;
+static Mutex* wasmjit_queue_lock = nullptr;
+static volatile int wasmjit_task_enrolled = 0;
 
 // The method's interpreter entry while it has Wasm code. Starts like a
 // ZeroEntry (entry_point), so the interpreter can call it unchanged.
@@ -80,6 +100,18 @@ void WasmJit::initialize() {
   if (mb != nullptr) wasmjit_max_bailouts = atoi(mb);
   const char* d = ::getenv("WASM_JIT_DIR");
   if (d != nullptr) wasmjit_dir = d;
+  const char* bm = ::getenv("WASM_JIT_BATCH_MS");
+  if (bm != nullptr) {
+    int v = atoi(bm);
+    wasmjit_batch_ms = v <= 0 ? 0 : clamp(align_up(v, (int) PeriodicTask::interval_gran),
+                                          (int) PeriodicTask::min_interval, (int) PeriodicTask::max_interval);
+  }
+  const char* bx = ::getenv("WASM_JIT_BATCH_MAX");
+  if (bx != nullptr) wasmjit_batch_max = MAX2(1, atoi(bx));
+  if (_enabled) {
+    wasmjit_queue_lock = new Mutex(Mutex::nosafepoint, "WasmJitQueue_lock");
+    wasmjit_queue = new GrowableArrayCHeap<WasmJitRequest, mtCode>(64);
+  }
   wasmjit_state = _enabled ? 2 : 1;
   _disabled = !_enabled;
 }
@@ -277,7 +309,7 @@ class WasmJitCompiler : public StackObj {
   enum { H_enter, H_return, H_bailout, H_safepoint, H_pre_call, H_post_call, H_new, H_subtype,
          H_icallee, H_osr_enter, H_finalizer, H_count };
   enum { T_entry, T_enter, T_return, T_bailout, T_safepoint, T_void_i32, T_pre_call, T_post_call,
-         T_new, T_i32x2, T_i32x1, T_count };
+         T_new, T_i32x2, T_i32x1, T_void, T_count };
   // wasm locals of the generated function
   enum { L_method = 0, L_basepc, L_thread,                 // params
          L_istate, L_lbase, L_slow, L_bb, L_i0, L_i1,       // i32
@@ -425,7 +457,13 @@ class WasmJitCompiler : public StackObj {
   // unknown or if the bytecode does not fall through.
   int depth_after(BytecodeStream& bs, int D);
   bool emit_function(WasmBuf& body);
-  bool compile(WasmBuf& module);
+  // Analyze and translate the method into a function body (locals + code).
+  bool compile(WasmBuf& body) { return analyze() && emit_function(body); }
+  // Module with n functions of type T_entry: funcs holds their code section
+  // entries (size-prefixed bodies). The functions are placed in table slots
+  // __table_base + 0..n-1, and the module constructor stores __table_base at
+  // table_base_addr.
+  static void build_module(const WasmBuf& funcs, int n, address table_base_addr, WasmBuf& module);
 };
 
 static int slots_of(TosState t) { return (t == ltos || t == dtos) ? 2 : 1; }
@@ -1125,16 +1163,13 @@ bool WasmJitCompiler::emit_function(WasmBuf& body) {
   return true;
 }
 
-bool WasmJitCompiler::compile(WasmBuf& module) {
-  if (!analyze()) return false;
-  WasmBuf body;
-  if (!emit_function(body)) return false;
-
+void WasmJitCompiler::build_module(const WasmBuf& funcs, int n, address table_base_addr, WasmBuf& module) {
   module.u8(0x00); module.u8('a'); module.u8('s'); module.u8('m');
   module.u8(1); module.u8(0); module.u8(0); module.u8(0);
-  { // dylink.0: no memory, no table entries of our own
+  { // dylink.0: no memory, n table slots (the loader reserves them on every thread)
+    WasmBuf info; info.uleb(0); info.uleb(0); info.uleb(n); info.uleb(0);
     WasmBuf s; s.str("dylink.0");
-    s.u8(1); s.uleb(4); s.uleb(0); s.uleb(0); s.uleb(0); s.uleb(0);   // WASM_DYLINK_MEM_INFO
+    s.u8(1); s.uleb(info.length()); s.append(info);   // WASM_DYLINK_MEM_INFO
     module.section(0, s);
   }
   { // types
@@ -1152,12 +1187,14 @@ bool WasmJitCompiler::compile(WasmBuf& module) {
     fn(7, 1);   // T_new       (thread, istate, bci, tos, kind, index, size) -> oop
     fn(2, 1);   // T_i32x2     subtype(sub, super), interface_callee(rcvr, entry)
     fn(1, 1);   // T_i32x1     osr_enter(thread) -> istate
+    fn(0, 0);   // T_void      __wasm_call_ctors
     module.section(1, s);
   }
-  { // imports
-    WasmBuf s; s.uleb(2 + H_count);
+  { // imports (function indices 0..H_count-1; global 0 = __table_base)
+    WasmBuf s; s.uleb(3 + H_count);
     s.str("env"); s.str("memory"); s.u8(2); s.u8(0x03); s.uleb(1); s.uleb(65536);   // shared memory
-    s.str("env"); s.str("__indirect_function_table"); s.u8(1); s.u8(0x70); s.u8(0x00); s.uleb(0);  // for call_indirect
+    s.str("env"); s.str("__indirect_function_table"); s.u8(1); s.u8(0x70); s.u8(0x00); s.uleb(0);
+    s.str("env"); s.str("__table_base"); s.u8(3); s.u8(W_I32); s.u8(0);           // immutable i32
     s.str("env"); s.str("wasmjit_enter");     s.u8(0); s.uleb(T_enter);
     s.str("env"); s.str("wasmjit_return");    s.u8(0); s.uleb(T_return);
     s.str("env"); s.str("wasmjit_bailout");   s.u8(0); s.uleb(T_bailout);
@@ -1171,18 +1208,34 @@ bool WasmJitCompiler::compile(WasmBuf& module) {
     s.str("env"); s.str("wasmjit_register_finalizer"); s.u8(0); s.uleb(T_safepoint);   // same type
     module.section(2, s);
   }
-  // functions: the compiled method and _emscripten_tls_init (required from
-  // every side module with pthreads; returns 0 = no TLS)
-  { WasmBuf s; s.uleb(2); s.uleb(T_entry); s.uleb(T_void_i32); module.section(3, s); }
+  // functions: the n compiled methods, _emscripten_tls_init (required from
+  // every side module with pthreads; returns 0 = no TLS) and the constructor
+  // (run once, by the loading thread)
+  const int f_tls = H_count + n, f_ctor = H_count + n + 1;
+  { WasmBuf s; s.uleb(n + 2);
+    for (int i = 0; i < n; i++) s.uleb(T_entry);
+    s.uleb(T_void_i32); s.uleb(T_void);
+    module.section(3, s); }
   { WasmBuf s; s.uleb(2);
-    s.str("wasmjit_entry"); s.u8(0); s.uleb(H_count);
-    s.str("_emscripten_tls_init"); s.u8(0); s.uleb(H_count + 1);
+    s.str("_emscripten_tls_init"); s.u8(0); s.uleb(f_tls);
+    s.str("__wasm_call_ctors"); s.u8(0); s.uleb(f_ctor);
     module.section(7, s); }
-  { WasmBuf s; s.uleb(2);
-    s.uleb(body.length()); s.append(body);
+  { // element segment: table[__table_base + i] = method i (initialized by every
+    // thread's instance, so no dlsym and no extra thread synchronization)
+    WasmBuf s; s.uleb(1);
+    s.uleb(0); s.u8(0x23); s.uleb(0); s.u8(OP_end);   // active, table 0, offset global.get 0
+    s.uleb(n); for (int i = 0; i < n; i++) s.uleb(H_count + i);
+    module.section(9, s); }
+  { WasmBuf s; s.uleb(n + 2);
+    s.append(funcs);
     s.uleb(4); s.uleb(0); s.u8(OP_i32_const); s.u8(0); s.u8(OP_end);      // tls_init: () -> 0
+    WasmBuf ctor; ctor.uleb(0);                                          // *table_base_addr = __table_base
+    ctor.u8(OP_i32_const); ctor.sleb((int32_t)(intptr_t) table_base_addr);
+    ctor.u8(0x23); ctor.uleb(0);
+    ctor.u8(OP_i32_store); ctor.uleb(2); ctor.uleb(0);
+    ctor.u8(OP_end);
+    s.uleb(ctor.length()); s.append(ctor);
     module.section(10, s); }
-  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,40 +1243,86 @@ bool WasmJitCompiler::compile(WasmBuf& module) {
 
 // dlopen makes every thread load the module into its own instance, which a
 // thread only does while it waits; do it at a safepoint, when all Java
-// threads are parked.
+// threads are parked. The module's constructor reports its table base.
 class VM_WasmJitLoad : public VM_Operation {
   const char* _path;
-  void* _fn;
+  int _table_base;
+  jlong _dlopen_ns;
  public:
-  VM_WasmJitLoad(const char* path) : _path(path), _fn(nullptr) {}
+  VM_WasmJitLoad(const char* path) : _path(path), _table_base(-1), _dlopen_ns(0) {}
   VMOp_Type type() const { return VMOp_ForceSafepoint; }
   void doit() {
+    wasmjit_table_base = -1;
+    jlong t0 = os::javaTimeNanos();
     void* handle = ::dlopen(_path, RTLD_NOW | RTLD_LOCAL);
+    _dlopen_ns = os::javaTimeNanos() - t0;
     if (handle == nullptr) {
       fprintf(stderr, "[wasmjit] dlopen(%s) failed: %s\n", _path, ::dlerror());
       return;
     }
-    _fn = ::dlsym(handle, "wasmjit_entry");
+    _table_base = wasmjit_table_base;
+    if (_table_base < 0) {
+      fprintf(stderr, "[wasmjit] %s: module constructor did not run\n", _path);
+    }
   }
-  void* fn() const { return _fn; }
+  int table_base() const { return _table_base; }
+  jlong dlopen_ns() const { return _dlopen_ns; }
 };
 
-void WasmJit::compile_and_install(Method* method, JavaThread* thread) {
+
+class WasmJitFlushTask : public PeriodicTask {
+ public:
+  WasmJitFlushTask(int ms) : PeriodicTask(ms) {}
+  void task() { WasmJit::flush_queue(); }
+};
+
+static void wasmjit_install(Method* method, address fn) {
+  WasmJitEntry* entry = (WasmJitEntry*) os::malloc(sizeof(WasmJitEntry), mtCode);
+  entry->entry_point = fn;
+  entry->interp_entry = method->interpreter_entry();
+  entry->bailouts = 0;
+  OrderAccess::release();
+  method->set_interpreter_entry((address) entry);
+  method->set_is_not_c2_compilable();   // marker: has Wasm code (see wasm_entry_of)
+}
+
+// Compile the methods into one module, load it and install the entry points.
+static void wasmjit_compile_batch(Thread* thread, const WasmJitRequest* reqs, int n) {
   ResourceMark rm(thread);
-  methodHandle mh(thread, method);
   jlong t0 = os::javaTimeNanos();
-  WasmJitCompiler c(mh);
-  WasmBuf module;
-  if (!c.compile(module)) {
-    if (_log) fprintf(stderr, "[wasmjit] failed %s: %s\n", method->name_and_sig_as_C_string(), c.failure());
-    return;
+  WasmBuf funcs;
+  Method** compiled = NEW_RESOURCE_ARRAY(Method*, n);
+  int k = 0;
+  for (int i = 0; i < n; i++) {
+    Method* method = reqs[i].method;
+    ResourceMark rm2(thread);
+    methodHandle mh(thread, method);
+    jlong c0 = os::javaTimeNanos();
+    WasmJitCompiler c(mh);
+    WasmBuf body;
+    if (!c.compile(body)) {
+      if (WasmJit::log()) fprintf(stderr, "[wasmjit] failed %s: %s\n", method->name_and_sig_as_C_string(), c.failure());
+      continue;
+    }
+    funcs.uleb(body.length());
+    funcs.append(body);
+    compiled[k++] = method;
+    if (WasmJit::log()) {
+      fprintf(stderr, "[wasmjit] %s: %d bytes bytecode -> %d bytes wasm, %d blocks, %d bailout sites, "
+                      "compile %.2f ms\n",
+              method->name_and_sig_as_C_string(), method->code_size(), body.length(), c.nblocks(),
+              c.bail_sites(), (os::javaTimeNanos() - c0) / 1e6);
+    }
   }
+  if (k == 0) return;
+  WasmBuf module;
+  WasmJitCompiler::build_module(funcs, k, (address) &wasmjit_table_base, module);
   char path[512];
-  int n = AtomicAccess::add(&wasmjit_module_counter, 1);
-  jio_snprintf(path, sizeof(path), "%s/wasmjit_%d_%d.so", wasmjit_dir, os::current_process_id(), n);
+  int id = AtomicAccess::add(&wasmjit_module_counter, 1);
+  jio_snprintf(path, sizeof(path), "%s/wasmjit_%d_%d.so", wasmjit_dir, os::current_process_id(), id);
   FILE* f = fopen(path, "wb");
   if (f == nullptr) {
-    if (_log) fprintf(stderr, "[wasmjit] cannot write %s\n", path);
+    if (WasmJit::log()) fprintf(stderr, "[wasmjit] cannot write %s\n", path);
     return;
   }
   fwrite(module.data(), 1, module.length(), f);
@@ -1233,21 +1332,71 @@ void WasmJit::compile_and_install(Method* method, JavaThread* thread) {
   VMThread::execute(&op);
   ::unlink(path);
   jlong t2 = os::javaTimeNanos();
-  if (op.fn() == nullptr) {
+  if (op.table_base() < 0) {
     return;
   }
-  WasmJitEntry* entry = (WasmJitEntry*) os::malloc(sizeof(WasmJitEntry), mtCode);
-  entry->entry_point = (address) op.fn();
-  entry->interp_entry = method->interpreter_entry();
-  entry->bailouts = 0;
-  method->set_interpreter_entry((address) entry);
-  method->set_is_not_c2_compilable();   // marker: has Wasm code (see wasm_entry_of)
-  if (_log) {
-    fprintf(stderr, "[wasmjit] %s: %d bytes bytecode -> %d bytes wasm, %d blocks, %d bailout sites, "
-                    "compile %.2f ms, load %.2f ms\n",
-            method->name_and_sig_as_C_string(), method->code_size(), module.length(), c.nblocks(),
-            c.bail_sites(), (t1 - t0) / 1e6, (t2 - t1) / 1e6);
+  for (int j = 0; j < k; j++) {
+    wasmjit_install(compiled[j], (address)(intptr_t)(op.table_base() + j));
   }
+  if (WasmJit::log()) {
+    fprintf(stderr, "[wasmjit] module %d: %d methods, %d bytes, compile %.2f ms, load %.2f ms (dlopen %.2f ms)\n",
+            id, k, module.length(), (t1 - t0) / 1e6, (t2 - t1) / 1e6, op.dlopen_ns() / 1e6);
+  }
+}
+
+void WasmJit::flush_queue() {
+  Thread* thread = Thread::current();
+  for (;;) {
+    WasmJitRequest* reqs;
+    int n;
+    {
+      MutexLocker ml(wasmjit_queue_lock, Mutex::_no_safepoint_check_flag);
+      n = MIN2(wasmjit_queue->length(), wasmjit_batch_max);
+      if (n == 0) return;
+      reqs = NEW_C_HEAP_ARRAY(WasmJitRequest, n, mtCode);
+      for (int i = 0; i < n; i++) reqs[i] = wasmjit_queue->at(i);
+      wasmjit_queue->remove_till(n);
+    }
+    wasmjit_compile_batch(thread, reqs, n);
+    for (int i = 0; i < n; i++) {
+      if (reqs[i].holder != nullptr) {
+        NativeAccess<>::oop_store(reqs[i].holder, (oop) nullptr);
+        Universe::vm_global()->release(reqs[i].holder);
+      }
+    }
+    FREE_C_HEAP_ARRAY(reqs);
+  }
+}
+
+void WasmJit::enqueue(Method* method, JavaThread* thread) {
+  method->set_is_not_c1_compilable();   // compile at most once
+  if (wasmjit_batch_ms == 0) {
+    WasmJitRequest r = { method, nullptr };   // the caller runs the method: not unloadable
+    wasmjit_compile_batch(thread, &r, 1);
+    return;
+  }
+  WasmJitRequest r = { method, nullptr };
+  ClassLoaderData* cld = method->method_holder()->class_loader_data();
+  if (!cld->is_boot_class_loader_data()) {
+    r.holder = Universe::vm_global()->allocate();
+    if (r.holder == nullptr) return;
+    NativeAccess<>::oop_store(r.holder, cld->holder());
+  }
+  if (wasmjit_task_enrolled == 0 && AtomicAccess::cmpxchg(&wasmjit_task_enrolled, 0, 1) == 0) {
+    (new WasmJitFlushTask(wasmjit_batch_ms))->enroll();
+  }
+  MutexLocker ml(wasmjit_queue_lock, Mutex::_no_safepoint_check_flag);
+  wasmjit_queue->append(r);
+}
+
+void WasmJit::request_compilation(Method* method, JavaThread* thread) {
+  // Make the stack walkable for the VM transition (the frame anchor is clear).
+  thread->set_last_Java_frame();
+  {
+    ThreadInVMfromJava tiv(thread);
+    enqueue(method, thread);
+  }
+  thread->reset_last_Java_frame();
 }
 
 static address wasm_entry_of(Method* method) {
@@ -1259,18 +1408,14 @@ bool WasmJit::osr(JavaThread* thread, BytecodeInterpreter* istate) {
   Method* method = istate->method();
   address fn = wasm_entry_of(method);
   if (fn == nullptr) {
+    // queued, attempted or not compilable
     if (method->is_not_c1_compilable() || method->is_synchronized() ||
         JvmtiExport::can_post_interpreter_events()) {
       return false;
     }
-    method->set_is_not_c1_compilable();   // compile at most once
-    // The frame was decached (bcp, tos) by the interpreter; make it walkable.
-    thread->set_last_Java_frame();
-    {
-      ThreadInVMfromJava tiv(thread);
-      compile_and_install(method, thread);
-    }
-    thread->reset_last_Java_frame();
+    // The frame was decached (bcp, tos) by the interpreter. With batching the
+    // interpreter continues; a later backedge check finds the compiled code.
+    request_compilation(method, thread);
     fn = wasm_entry_of(method);
     if (fn == nullptr) return false;
   }
@@ -1308,13 +1453,7 @@ void WasmJit::on_interpreted_invocation(Method* method, JavaThread* thread) {
     method->set_is_not_c1_compilable();
     return;
   }
-  method->set_is_not_c1_compilable();   // compile at most once
-  thread->set_last_Java_frame();
-  {
-    ThreadInVMfromJava tiv(thread);
-    compile_and_install(method, thread);
-  }
-  thread->reset_last_Java_frame();
+  request_compilation(method, thread);
 }
 
 #endif // __EMSCRIPTEN__

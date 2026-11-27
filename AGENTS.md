@@ -261,15 +261,30 @@ Environment variables: `WASM_JIT=1` enables it; `WASM_JIT_THRESHOLD` (default
 1000 interpreted invocations), `WASM_JIT_OSR_THRESHOLD` (default 10000 backward
 branches), `WASM_JIT_LOG=1` (compilations, OSR, reverts) or `2` (also every
 bailout), `WASM_JIT_MAX_BAILOUTS` (default 10000, then the method is reverted
-to the interpreter), `WASM_JIT_DIR` (default `/tmp`, generated modules are
+to the interpreter), `WASM_JIT_BATCH_MS` (default 50, rounded to a multiple
+of 10: batching interval; `0` compiles synchronously in the calling thread, one
+method per module, as before batching), `WASM_JIT_BATCH_MAX` (default 256
+methods per module), `WASM_JIT_DIR` (default `/tmp`, generated modules are
 deleted after loading).
 
 Design (`wasmJit_zero.cpp`):
-- One Wasm function per method with the Zero entry ABI, in an Emscripten side
-  module (dylink.0, imports `env.memory`, `env.__indirect_function_table` and
-  the `wasmjit_*` helpers by name, exports `wasmjit_entry` and
-  `_emscripten_tls_init`), written to a file and loaded with `dlopen` in a VM
-  operation at a safepoint.
+- One Wasm function per method with the Zero entry ABI. Methods that reach the
+  threshold (or the OSR threshold) are queued (`WasmJit::enqueue`, the class
+  loader is kept alive by an OopStorage handle while queued); a `PeriodicTask`
+  on the WatcherThread (`WasmJit::flush_queue`, every `WASM_JIT_BATCH_MS`)
+  compiles the queue in the background and puts it into one Emscripten side
+  module, written to a file and loaded with `dlopen` in a VM operation at a
+  safepoint. The interpreter keeps running the methods meanwhile; OSR finds the
+  compiled code at a later backward-branch check.
+- Module layout: dylink.0 declares `n` table slots (the loader grows the table
+  by `n` on every thread); imports `env.memory`,
+  `env.__indirect_function_table`, the global `env.__table_base` and the
+  `wasmjit_*` helpers by name; an active element segment at
+  `global.get __table_base` puts method `i` into slot `__table_base + i`; the
+  exported `__wasm_call_ctors` (run once, by the loading thread) stores
+  `__table_base` into `wasmjit_table_base`; `_emscripten_tls_init` is exported
+  too. A function pointer on Emscripten is a table index, so the entry point of
+  method `i` is `__table_base + i`, without `dlsym`.
 - Compiled code creates a real interpreter frame (`wasmjit_enter`) and keeps
   locals and the expression stack in it; the stack depth is known statically
   per bytecode, so every slot is a load/store at a constant offset. GC, stack
@@ -302,9 +317,39 @@ fields 58 / 31, calls 192 / 151, sieve 30 / 36, alloc 241 / 261, longDouble
 about 1 s of module loading (71 modules, about 14 ms each) inside the timed
 kernels.
 
+Batching (Bench, 69 to 71 methods; totals vary by ±150 ms between runs, mostly
+`strings`):
+
+| `WASM_JIT_BATCH_MS` | Modules | Load time | Total |
+|---|---|---|---|
+| 0 (one module per method) | 71 | about 885 ms | 2195 to 2378 |
+| 20 | 19 to 22 | 310 to 340 ms | 1855 to 2138 |
+| 50 (default) | 12 to 14 | 215 to 250 ms | 1793 to 2107 |
+| 200 | 8 | about 110 ms | 2010 to 2039 (short kernels compile later) |
+
+Hello (`-Xmx64m`, no AOT cache, wall clock): 1.0 s without the compiler, 1.75
+to 1.86 s with one module per method (51), 1.13 to 1.24 s batched (4 to 13
+modules). At the default threshold the compiler does not pay off for Hello yet.
+
+Why a load costs 10 to 20 ms independent of size (measured by instrumenting
+`java.js`): `dlopen` and every `dlsym` of a function call
+`_emscripten_dlsync_threads`, proxied to the JS main thread, which wakes each
+other thread in turn (`_emscripten_proxy_dlsync_async` ->
+`_emscripten_thread_notify`, which spins on `Atomics.notify` until the target
+leaves `atomic.wait`). On 4 cores a single wake-up sometimes takes 2 to 4 ms,
+so the loop over about 9 threads takes about 10 to 15 ms; compiling the module
+(0.04 ms for 1 KB), instantiating it (0.5 ms) and `postInstantiation` (1 ms)
+are small. Hence one module per batch, and no `dlsym` (it would sync again).
+
 Pitfalls found while building it:
 - Every side module must export `_emscripten_tls_init` when pthreads are used
   ("TypeError: tlsInitFunc is not a function"); returning 0 means no TLS.
+- `dlsym` of a function that is not in the table yet adds it to the table and
+  synchronizes all threads, like `dlopen`; place functions in the table with an
+  element segment instead (see module layout).
+- Compilation now runs on the WatcherThread, concurrently with Java threads and
+  GC (like HotSpot compiler threads): it may read metadata but no oops, and a
+  queued method's class loader must stay alive until it is installed.
 - Wasm memory instructions reject alignment hints larger than the access width
   (8/16-bit accesses need 0/1).
 - `Object.<init>` ends in `_return_register_finalizer`; bailing there made
@@ -343,8 +388,9 @@ Pitfalls found while building it:
 ## Next steps
 
 1. Baseline compiler follow-ups:
-   - batch several methods per module and load them together (each `dlopen`
-     costs about 6 to 30 ms, growing with the number of loaded modules);
+   - loading still costs 10 to 20 ms per module (thread wake-ups in
+     Emscripten's dlsync, see above): fewer live threads at load time, or a
+     patched dlsync that notifies all threads first and then waits;
    - cheaper calls: inline frame setup/teardown instead of the
      `wasmjit_enter`/`return`/`pre_call`/`post_call` helpers, and direct calls
      between compiled methods;

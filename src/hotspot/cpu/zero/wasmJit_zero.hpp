@@ -10,8 +10,16 @@
  * entries) bails out: the frame is handed to the interpreter at the current
  * bytecode, which finishes the method.
  *
+ * Loading a module synchronizes all threads (each instantiates it), so hot
+ * methods are queued and compiled in batches, one module per batch, by a
+ * periodic task on the WatcherThread (in the background; the interpreter keeps
+ * running the methods meanwhile).
+ *
  * Enabled with the environment variable WASM_JIT=1. WASM_JIT_THRESHOLD sets the
  * number of interpreted invocations before compiling (default 1000),
+ * WASM_JIT_BATCH_MS the batching interval (default 50, multiple of 10; 0 =
+ * compile synchronously in the calling thread, one method per module),
+ * WASM_JIT_BATCH_MAX the maximum number of methods per module (default 256),
  * WASM_JIT_LOG=1 logs compilations, WASM_JIT_DIR the directory for the
  * generated modules (default /tmp).
  */
@@ -30,6 +38,7 @@ class Method;
 class WasmJit : AllStatic {
  public:
   static bool enabled() { return _enabled; }
+  static bool log() { return _log; }
   // false until initialized (then the result of WASM_JIT)
   static bool disabled() { return _disabled; }
   static void initialize();
@@ -38,10 +47,13 @@ class WasmJit : AllStatic {
   // Called by the interpreter on backward branches: true if it should stop and
   // let main_loop try on-stack replacement (msg do_osr).
   static inline bool osr_check(Method* method);
-  // Called by ZeroInterpreter::main_loop for do_osr: compile if needed and
-  // continue the current frame in compiled code. Returns true if the compiled
-  // code finished the method (frame popped, result pushed).
+  // Called by ZeroInterpreter::main_loop for do_osr: if the method has
+  // compiled code, continue the current frame in it and return true (the
+  // compiled code finished the method: frame popped, result pushed).
+  // Otherwise queue it for compilation and return false.
   static bool osr(JavaThread* thread, BytecodeInterpreter* istate);
+  // Compile and load the queued methods (WatcherThread).
+  static void flush_queue();
 
   // Offsets into the interpreter state used by generated code.
   static int istate_locals_offset();
@@ -53,7 +65,10 @@ class WasmJit : AllStatic {
   static int _threshold;
   static int _osr_threshold;
   static bool _log;
-  static void compile_and_install(Method* method, JavaThread* thread);
+  // Queue the method for compilation (or compile it right away if batching is
+  // off). The thread is in Java state with the frame anchor cleared.
+  static void request_compilation(Method* method, JavaThread* thread);
+  static void enqueue(Method* method, JavaThread* thread);
 };
 
 #include "oops/method.hpp"
